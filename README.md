@@ -34,7 +34,7 @@ git config core.hooksPath .githooks
 ## インストール
 
 ```
-git clone git@github.com:sngymgt/cli-slk.git ~/src/slk
+git clone git@github.com:sngymgt/slk.git ~/src/slk
 ln -s ~/src/slk/slk ~/.local/bin/slk
 git -C ~/src/slk config core.hooksPath .githooks
 ```
@@ -47,7 +47,7 @@ git -C ~/src/slk config core.hooksPath .githooks
 2. <https://api.slack.com/apps> → Create New App → **From a manifest** → ワークスペースを選んで貼る
 3. **Distribution は有効にしない**（後述）
 4. OAuth & Permissions → Redirect URLs に GitHub Pages の着地ページを**末尾スラッシュまで完全一致**で登録
-   （`https://sngymgt.github.io/cli-slk/callback/`）
+   （`https://sngymgt.github.io/slk/callback/`）
 5. Basic Information の `client_id` と、4 の URL を `app.json` に書いてコミットする
 6. `client_secret` は**コミットしない**。1Password に入れておく（`slk login` の初回に 1 度だけ聞かれ、
    以降は Keychain から読む）
@@ -88,7 +88,7 @@ slk profile add <プロファイル名>      # xoxp- を貼る（画面には出
 持ち越す必要があるものは無い。以下だけで元に戻る。
 
 ```
-git clone git@github.com:sngymgt/cli-slk.git ~/src/slk
+git clone git@github.com:sngymgt/slk.git ~/src/slk
 ln -s ~/src/slk/slk ~/.local/bin/slk
 slk login
 ```

@@ -1,5 +1,5 @@
 {
   "client_id": "",
-  "redirect_uri": "https://sngymgt.github.io/cli-slk/callback/",
+  "redirect_uri": "https://sngymgt.github.io/slk/callback/",
   "_note": "client_id は Slack アプリの Basic Information、redirect_uri は GitHub Pages の着地ページ（末尾スラッシュまで完全一致）。client_secret はここに書かない（Keychain に入る）"
 }
