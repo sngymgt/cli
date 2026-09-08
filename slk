@@ -47,8 +47,12 @@ PROFILE_ROOT = os.path.join(CONFIG_ROOT, "profiles")
 ACTIVE_FILE = os.path.join(CONFIG_ROOT, "active")
 
 KEYCHAIN_SERVICE = os.environ.get("SLK_KEYCHAIN_SERVICE") or "slk"
-# client_secret はプロファイルではなくアプリのものなので、専用の account に置く
-APP_SECRET_ACCOUNT = "__app__"
+# client_secret はプロファイルではなくアプリのものなので、専用の account に置く。
+# client_id ごとに分けるのは、別アプリに切り替えたときに前の secret を掴まないため
+APP_SECRET_PREFIX = "__app__"
+# この error が返ったら secret 側の問題なので、入力し直して 1 度だけやり直す
+BAD_SECRET_ERRORS = ("invalid_client_id", "bad_client_secret",
+                     "invalid_client_secret", "client_secret_missing")
 
 AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"
 
@@ -1096,18 +1100,26 @@ def load_app():
         "リポジトリ同梱のものを記入してください）")
 
 
-def app_secret():
-    sec = keychain_get(APP_SECRET_ACCOUNT) if keychain_ok() else None
-    if sec:
-        return sec
+def secret_account(app):
+    return f"{APP_SECRET_PREFIX}.{app['client_id']}"
+
+
+def app_secret(app, reset=False):
+    acct = secret_account(app)
+    if not reset:
+        sec = keychain_get(acct) if keychain_ok() else None
+        if sec:
+            return sec
     if not sys.stdin.isatty():
-        die("client_secret が Keychain にありません。対話環境で slk login を 1 度実行してください")
-    note("アプリの client_secret を 1 度だけ登録します（Keychain に入り、次回から聞きません）")
+        die(f"client_secret が Keychain（account={acct}）にありません。"
+            "対話環境で slk login を 1 度実行してください")
+    note("アプリの client_secret を登録します（Keychain に入り、次回から聞きません）")
+    note("入れ直したいときは slk login --reset-secret")
     sec = getpass.getpass("client_secret: ").strip()
     if not sec:
         die("client_secret が空です")
     if keychain_ok():
-        ok, err = keychain_set(APP_SECRET_ACCOUNT, sec)
+        ok, err = keychain_set(acct, sec)
         if not ok:
             warn(f"Keychain に保存できませんでした（今回だけ使います）: {err}")
     return sec
@@ -1126,15 +1138,11 @@ def oauth_exchange(app, secret, code):
     except urllib.error.HTTPError as e:
         die(f"oauth.v2.access -> HTTP {e.code} {e.read().decode()[:300]}")
     if not blob.get("ok"):
-        hints = {"invalid_code": "コードは 1 度しか使えず数分で失効します。slk login からやり直してください",
-                 "bad_redirect_uri": "app.json の redirect_uri が Slack 側の登録と完全一致していません",
-                 "invalid_client_id": "app.json の client_id が違います"}
-        err = blob.get("error", "?")
-        die(f"トークン交換に失敗しました: {err}" + (f"（{hints[err]}）" if err in hints else ""))
+        return None, blob.get("error", "?")
     token = (blob.get("authed_user") or {}).get("access_token")
     if not token:
         die("user token が返りませんでした（認可 URL の user_scope を確認してください）")
-    return token
+    return token, None
 
 
 class _Catcher(http.server.BaseHTTPRequestHandler):
@@ -1211,9 +1219,9 @@ def install_token(name, token, auth, quiet=False):
 
 
 def cmd_login(args):
-    opts, rest = take_opts(args, {"--manual": False, "--timeout": True})
+    opts, rest = take_opts(args, {"--manual": False, "--timeout": True, "--reset-secret": False})
     app, app_path = load_app()
-    secret = app_secret()
+    secret = app_secret(app, reset=bool(opts.get("--reset-secret")))
     nonce = secrets.token_urlsafe(16)
 
     srv = None
@@ -1258,7 +1266,23 @@ def cmd_login(args):
     if not got.get("code"):
         die("code が取れませんでした")
 
-    token = oauth_exchange(app, secret, got["code"])
+    token, err = oauth_exchange(app, secret, got["code"])
+    if err in BAD_SECRET_ERRORS:
+        # 誤入力・ローテーション後の古い値が Keychain に残っているケース。
+        # 入れ直して同じ code でもう 1 度だけ試す（失敗した交換では code は消費されない）
+        warn(f"client_secret が受け付けられませんでした（{err}）")
+        if not sys.stdin.isatty():
+            die("対話環境で slk login --reset-secret を実行して入れ直してください")
+        secret = app_secret(app, reset=True)
+        token, err = oauth_exchange(app, secret, got["code"])
+    if err:
+        hints = {
+            "invalid_code": "コードは 1 度きり・数分で失効します。slk login からやり直してください",
+            "bad_redirect_uri": "app.json の redirect_uri が Slack 側の登録と完全一致していません",
+            "invalid_client_id": "app.json の client_id が違います",
+            "bad_client_secret": "slk login --reset-secret で入れ直してください",
+        }
+        die(f"トークン交換に失敗しました: {err}" + (f"（{hints[err]}）" if err in hints else ""))
     auth = call(token, "auth.test")
     name = rest[0] if rest else None
     if not name:
@@ -1459,7 +1483,8 @@ def cmd_profile(args):
 USAGE = """usage: slk [--profile <name>] [--json|--raw] [--quiet] <command>
 
   slk manifest [--search both|legacy|rts]   アプリ作成用の manifest を出す
-  slk login [<profile 名>] [--manual]       ブラウザで承認して自分のトークンを取る
+  slk login [<profile 名>] [--manual] [--reset-secret]
+                                            ブラウザで承認して自分のトークンを取る
   slk profile [list|current|use|add|keychain [--force]|label|path|rm]
   slk whoami                                トークンの持ち主とワークスペース
 

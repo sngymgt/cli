@@ -71,6 +71,10 @@ slk login
 自動でターミナルに戻れない場合は着地ページにコードが出るので、それを貼れば同じ結果になる
 （`slk login --manual` で最初から貼り付け方式）。
 
+`client_secret` は `client_id` ごとに別枠で Keychain に入るので、アプリを差し替えても前の値を
+掴まない。打ち間違えた・Slack 側でローテーションした場合は `slk login --reset-secret` で入れ直す。
+交換時に secret が拒否されたときは、その場で入力し直して同じコードのまま再試行する。
+
 ### アプリ設定画面からトークンをコピーする方法
 
 `app.json` も client_secret も要らない代わりに、アプリの collaborator である必要がある。
