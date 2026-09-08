@@ -1075,6 +1075,13 @@ def save_team(dir_, auth):
 
 # --- OAuth ログイン ------------------------------------------------------------
 
+def _peek(path):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return {}
+
+
 def load_app():
     """OAuth アプリの設定。個人の設定ディレクトリ → スクリプトと同じ場所（＝リポジトリ）の順。
 
@@ -1093,9 +1100,10 @@ def load_app():
             return blob, path
         blank.append(path)
     if blank:
-        die(f"{blank[0]} の client_id / redirect_uri が空です。\n"
-            "    Slack アプリを作り、Basic Information の client_id と、\n"
-            "    OAuth & Permissions に登録した Redirect URL を記入してください")
+        missing = [k for k in ("client_id", "redirect_uri") if not _peek(blank[0]).get(k)]
+        die(f"{blank[0]} の {' と '.join(missing)} が空です。\n"
+            "    client_id は Slack アプリの Basic Information、\n"
+            "    redirect_uri は OAuth & Permissions に登録した Redirect URL（末尾スラッシュまで一致）")
     die(f"app.json がありません（{os.path.join(CONFIG_ROOT, 'app.json')} を作るか、"
         "リポジトリ同梱のものを記入してください）")
 
