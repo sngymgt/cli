@@ -34,12 +34,13 @@ git config core.hooksPath .githooks
 ## インストール
 
 ```
-git clone git@github.com:sngymgt/slk.git ~/src/slk
-ln -s ~/src/slk/slk ~/.local/bin/slk
-git -C ~/src/slk config core.hooksPath .githooks
+git clone git@github.com:sngymgt/slk.git
+cd slk
+ln -s "$PWD/slk" ~/.local/bin/slk
+git config core.hooksPath .githooks
 ```
 
-`~/.local/bin` に PATH が通っていること。更新は `git pull` だけ。
+置き場所はどこでもよい。`~/.local/bin` に PATH が通っていること。更新は `git pull` だけ。
 
 ## セットアップ（ワークスペースに 1 回だけ）
 
@@ -88,8 +89,9 @@ slk profile add <プロファイル名>      # xoxp- を貼る（画面には出
 持ち越す必要があるものは無い。以下だけで元に戻る。
 
 ```
-git clone git@github.com:sngymgt/slk.git ~/src/slk
-ln -s ~/src/slk/slk ~/.local/bin/slk
+git clone git@github.com:sngymgt/slk.git
+cd slk
+ln -s "$PWD/slk" ~/.local/bin/slk
 slk login
 ```
 
