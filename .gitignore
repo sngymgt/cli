@@ -1,0 +1,8 @@
+# 取得したデータは絶対にコミットしない（public repo の履歴は消せない）
+*.md.log
+out/
+data/
+env
+app.local.json
+__pycache__/
+.DS_Store

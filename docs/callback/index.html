@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
+<title>slk — 認証</title>
+<!--
+  Slack の OAuth 着地ページ。CLI が state の先頭に埋めたポートへ投げ返すだけ。
+  外部リソースを 1 つでも読み込むと Referer 経由で ?code= が第三者に渡るので、
+  CSS も含めてすべてこのファイルに閉じること。
+-->
+<style>
+  body { font: 15px/1.7 -apple-system, system-ui, sans-serif; margin: 0; padding: 2.5rem 1.5rem;
+         color: #1a1a1a; background: #fafafa; }
+  main { max-width: 34rem; margin: 0 auto; }
+  h1 { font-size: 1.15rem; margin: 0 0 1rem; }
+  code { font: 13px ui-monospace, monospace; background: #eee; padding: .15em .4em; border-radius: 3px; }
+  #code { display: block; padding: .8rem; word-break: break-all; background: #fff;
+          border: 1px solid #ddd; border-radius: 6px; margin: .6rem 0; }
+  button { font: inherit; padding: .45rem 1rem; border: 1px solid #bbb; border-radius: 6px;
+           background: #fff; cursor: pointer; }
+  .hide { display: none; }
+  .err { color: #a00; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e8e8e8; background: #1b1b1b; }
+    code, #code { background: #2a2a2a; border-color: #3a3a3a; }
+    button { background: #2a2a2a; border-color: #4a4a4a; color: inherit; }
+  }
+</style>
+<main>
+  <h1 id="head">認証を処理しています…</h1>
+  <div id="ok" class="hide">
+    <p>ターミナルに戻れない場合は、下のコードを <code>slk login</code> に貼り付けてください。</p>
+    <code id="code"></code>
+    <button id="copy">コピー</button>
+  </div>
+  <p id="err" class="hide err"></p>
+</main>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var code = q.get("code"), state = q.get("state") || "", error = q.get("error");
+  var head = document.getElementById("head");
+
+  if (error) {
+    head.textContent = "承認されませんでした";
+    var e = document.getElementById("err");
+    e.textContent = error;
+    e.classList.remove("hide");
+    return;
+  }
+  if (!code) {
+    head.textContent = "このページは slk の認証用です";
+    return;
+  }
+
+  document.getElementById("code").textContent = code;
+  document.getElementById("copy").onclick = function () {
+    navigator.clipboard.writeText(code).then(function () {
+      document.getElementById("copy").textContent = "コピーしました";
+    });
+  };
+
+  // state の先頭が CLI の待ち受けポート。0 なら CLI は貼り付けを待っている
+  var port = parseInt(state.split(".")[0], 10);
+  if (port > 0 && port < 65536) {
+    head.textContent = "ターミナルに戻しています…";
+    // 自動で戻せないブラウザがあるので、貼り付け手段は必ず見せる
+    setTimeout(function () {
+      head.textContent = "認証コードを取得しました";
+      document.getElementById("ok").classList.remove("hide");
+    }, 1500);
+    location.replace("http://127.0.0.1:" + port + "/?" + location.search.replace(/^\?/, ""));
+  } else {
+    head.textContent = "認証コードを取得しました";
+    document.getElementById("ok").classList.remove("hide");
+  }
+})();
+</script>

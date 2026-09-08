@@ -1,0 +1,1527 @@
+#!/usr/bin/env python3
+"""Slack を利用者として読むための CLI（read-only）。ワークスペースはプロファイルで切り替える。
+
+知らないと必ず一度踏む Slack 側の癖:
+
+- search.messages は user token (xoxp-) 専用。bot token では not_allowed_token_type で必ず落ちる。
+- conversations.history / replies の「15 件・1 req/分」制限は配布アプリ向けで、ワークスペース
+  内製アプリは対象外（1000 件・50+ req/分）。**アプリの Distribution を有効にした瞬間に履歴
+  取得が実用外になる**ので有効にしないこと。
+- HTTP メソッドは読み書きの境界にならない（chat.postMessage も GET で通る）。read-only を
+  守っているのは READ_METHODS の allowlist と、manifest が書き込み scope を要求しないことの
+  2 点だけで、どちらかを外すと CLI は黙って書けるようになる。
+  例外は oauth.v2.access ひとつで、これはワークスペースのデータを読まずトークンを発行する
+  だけなので allowlist を通さない（通す枠に入れると、そこが読み取り以外の入口になる）。
+- 検索も履歴もトークンの持ち主に見える範囲しか返さない。0 件は「無い」ではなく「見えていない」
+  かもしれない。フリープランでは 90 日より古いメッセージがどちらにも出ない。
+- ユーザー ID / チャンネル ID はワークスペース内でしか意味を持たない。キャッシュをプロファイル
+  間で共有すると、エラーにならず別人の名前で表示される。
+- Keychain の項目は (service, account) だけが鍵で、SLK_CONFIG_DIR は鍵に入らない。別の設定
+  ディレクトリでも**同名プロファイルなら同じトークンを引く**ので、試験用の設定ディレクトリを
+  作るときは SLK_KEYCHAIN_SERVICE も一緒に変えること。
+- conversations.history は latest から過去へ向かってしか読めない。ある時刻より後ろの N 件は
+  窓を広げて「窓の中を全部取り切った」状態を作ってから先頭を取る（messages_after）。
+- assistant.search.context は AI 向けを謳っているが実際はキーワード一致で、文章を丸ごと投げると
+  0 件になる（「リリース手順の決まりごと」は 0 件、「リリース」は 20 件）。単語で渡すこと。
+"""
+
+import getpass
+import html
+import http.server
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from datetime import datetime
+
+CONFIG_ROOT = os.path.expanduser(os.environ.get("SLK_CONFIG_DIR") or "~/.config/slk")
+PROFILE_ROOT = os.path.join(CONFIG_ROOT, "profiles")
+ACTIVE_FILE = os.path.join(CONFIG_ROOT, "active")
+
+KEYCHAIN_SERVICE = os.environ.get("SLK_KEYCHAIN_SERVICE") or "slk"
+# client_secret はプロファイルではなくアプリのものなので、専用の account に置く
+APP_SECRET_ACCOUNT = "__app__"
+
+AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"
+
+API_BASE = "https://slack.com/api"
+USER_AGENT = "slk/1.0"
+MIN_INTERVAL = 0.2
+LIST_TTL = 24 * 3600
+MAX_RETRY = 3
+
+# read-only の砦。ここに無いメソッドは slk api でも呼べない
+READ_METHODS = {
+    "auth.test": "GET",
+    "team.info": "GET",
+    "team.profile.get": "GET",
+    "search.messages": "GET",
+    "search.files": "GET",
+    "search.all": "GET",
+    "assistant.search.context": "POST",
+    "conversations.list": "GET",
+    "conversations.info": "GET",
+    "conversations.history": "GET",
+    "conversations.replies": "GET",
+    "conversations.members": "GET",
+    "bots.info": "GET",
+    "users.list": "GET",
+    "users.info": "GET",
+    "users.lookupByEmail": "GET",
+    "users.conversations": "GET",
+    "users.profile.get": "GET",
+    "usergroups.list": "GET",
+    "usergroups.users.list": "GET",
+    "emoji.list": "GET",
+    "files.list": "GET",
+    "files.info": "GET",
+    "pins.list": "GET",
+    "reactions.get": "GET",
+    "bookmarks.list": "GET",
+}
+
+USER_SCOPES = [
+    "channels:history", "channels:read",
+    "groups:history", "groups:read",
+    "im:history", "im:read",
+    "mpim:history", "mpim:read",
+    "users:read", "users:read.email", "usergroups:read",
+    "team:read", "files:read", "pins:read", "reactions:read", "bookmarks:read",
+    "search:read",
+    "search:read.public", "search:read.private", "search:read.im",
+    "search:read.mpim", "search:read.files", "search:read.users",
+]
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+ID_RE = re.compile(r"^[CDGU][A-Z0-9]{6,}$")
+MENTION_RE = re.compile(r"<([@#!])([A-Za-z0-9^]+)(?:\|([^>]*))?>")
+ANGLE_RE = re.compile(r"<([^>|]+)(?:\|([^>]*))?>")
+ARCHIVE_RE = re.compile(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})")
+
+G = {}
+
+
+def die(msg):
+    print(f"slk: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg):
+    print(f"slk: {msg}", file=sys.stderr)
+
+
+def note(msg):
+    print(f"# {msg}", file=sys.stderr)
+
+
+def out_json(obj):
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def human():
+    return not (G.get("--json") or G.get("--raw"))
+
+
+def take_opts(args, spec):
+    """spec は {"--flag": False, "--key": True}。オプションと位置引数に割る。"""
+    opts, rest, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            rest.extend(args[i + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            key, inline = (a.split("=", 1) + [None])[:2]
+            if key not in spec:
+                die(f"不明なオプション: {key}")
+            if spec[key]:
+                if inline is None:
+                    i += 1
+                    if i >= len(args):
+                        die(f"{key} には値が必要です")
+                    inline = args[i]
+                opts[key] = inline
+            else:
+                if inline is not None:
+                    die(f"{key} は値を取りません")
+                opts[key] = True
+        else:
+            rest.append(a)
+        i += 1
+    return opts, rest
+
+
+def to_epoch(spec):
+    """YYYY-MM-DD / YYYY-MM-DD HH:MM / epoch を秒に。"""
+    spec = spec.strip()
+    if re.fullmatch(r"\d{9,10}(\.\d+)?", spec):
+        return float(spec)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(spec, fmt).timestamp()
+        except ValueError:
+            pass
+    die(f"日時として読めません: {spec}（YYYY-MM-DD か epoch）")
+
+
+def fmt_ts(ts):
+    try:
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return str(ts)
+
+
+# --- transport --------------------------------------------------------------
+
+_last_call = 0.0
+
+
+def _http(method, verb, token, params):
+    global _last_call
+    flat = {}
+    for k, v in (params or {}).items():
+        if v is None:
+            continue
+        flat[k] = "true" if v is True else "false" if v is False else str(v)
+    url = f"{API_BASE}/{method}"
+    body = None
+    if verb == "GET":
+        if flat:
+            url += "?" + urllib.parse.urlencode(flat)
+    else:
+        body = urllib.parse.urlencode(flat).encode()
+    req = urllib.request.Request(url, data=body, method=verb)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("User-Agent", USER_AGENT)
+    if body is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    wait = MIN_INTERVAL - (time.time() - _last_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call = time.time()
+    with urllib.request.urlopen(req) as res:
+        return json.loads(res.read().decode())
+
+
+def call(token, method, params=None, _verb=None, _tries=0):
+    verb = _verb or READ_METHODS.get(method)
+    if verb is None:
+        die(f"{method} は read-only の allowlist にありません（slk api help で一覧）")
+    try:
+        res = _http(method, verb, token, params)
+    except urllib.error.HTTPError as e:
+        if e.code == 429 and _tries < MAX_RETRY:
+            delay = int(e.headers.get("Retry-After") or 30)
+            warn(f"{method}: レート制限。{delay}s 待って再試行します")
+            time.sleep(delay + 1)
+            return call(token, method, params, _verb, _tries + 1)
+        die(f"{method} -> HTTP {e.code} {e.read().decode()[:500]}")
+    except urllib.error.URLError as e:
+        die(f"{method} -> 接続できません: {e.reason}")
+    if res.get("ok"):
+        return res
+    err = res.get("error", "?")
+    if err == "method_not_supported_for_http_method" and _tries == 0:
+        return call(token, method, params, "POST" if verb == "GET" else "GET", 1)
+    if err == "missing_scope":
+        die(f"{method}: scope 不足。必要={res.get('needed')} / 現在={res.get('provided')}\n"
+            f"    slk manifest の scope でアプリを更新し、ワークスペースに再インストールしてください")
+    hints = {
+        "invalid_auth": "トークンが無効です（slk profile add でやり直す）",
+        "token_expired": "トークンの期限が切れています（slk profile add でやり直す）",
+        "account_inactive": "アカウントが無効化されています",
+        "not_allowed_token_type": "user token (xoxp-) が必要です。bot token では検索できません",
+        "not_in_channel": "そのチャンネルに参加していないため読めません",
+        "channel_not_found": "チャンネルが見つかりません（ID か、参加済みかを確認）",
+        "ratelimited": "レート制限に掛かりました。少し待って再実行してください",
+    }
+    die(f"{method} -> {err}" + (f"（{hints[err]}）" if err in hints else ""))
+
+
+# --- profile ----------------------------------------------------------------
+
+def keychain_ok():
+    return sys.platform == "darwin" and bool(shutil.which("security"))
+
+
+def keychain_get(name):
+    r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
+                        "-a", name, "-w"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def keychain_set(name, token):
+    """トークンを argv に置かない（ps から他プロセスに見える）。security は -w に値を
+    渡さないと stdin から入力と確認の 2 回読むので、同じ値を 2 行流す。"""
+    r = subprocess.run(["security", "add-generic-password", "-s", KEYCHAIN_SERVICE,
+                        "-a", name, "-U", "-w"],
+                       input=f"{token}\n{token}\n", capture_output=True, text=True)
+    return r.returncode == 0, (r.stderr or "").strip()
+
+
+def keychain_del(name):
+    subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name],
+                   capture_output=True)
+
+
+def file_token(dir_):
+    path = os.path.join(dir_, "env")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("SLACK_USER_TOKEN="):
+                tok = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if tok:
+                    return tok
+    return None
+
+
+def token_where(name):
+    """そのプロファイルのトークンがどこにあるか。None なら未認証。"""
+    if keychain_ok() and keychain_get(name):
+        return "keychain"
+    if file_token(os.path.join(PROFILE_ROOT, name)):
+        return "file"
+    return None
+
+
+def write_env_stub(dir_):
+    path = os.path.join(dir_, "env")
+    with open(path, "w") as f:
+        f.write(f"# トークンは macOS Keychain にあります"
+                f"（service={KEYCHAIN_SERVICE} / account={os.path.basename(dir_)}）\n")
+    os.chmod(path, 0o600)
+
+
+def profile_dir(name):
+    if not NAME_RE.match(name or ""):
+        die(f"プロファイル名に使えない文字が含まれています: {name}")
+    return os.path.join(PROFILE_ROOT, name)
+
+
+def list_profiles():
+    if not os.path.isdir(PROFILE_ROOT):
+        return []
+    return sorted(n for n in os.listdir(PROFILE_ROOT)
+                  if not n.startswith(".") and os.path.isdir(os.path.join(PROFILE_ROOT, n)))
+
+
+def active_name():
+    for src in (G.get("--profile"), os.environ.get("SLK_PROFILE")):
+        if src:
+            return src
+    if os.path.exists(ACTIVE_FILE):
+        with open(ACTIVE_FILE) as f:
+            name = f.readline().strip()
+        if name:
+            return name
+    names = list_profiles()
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        die("プロファイルがありません（slk manifest → アプリ作成 → slk profile add <name>）")
+    die("有効なプロファイルが未設定です（slk profile use <name>）")
+
+
+class Profile:
+    def __init__(self, name):
+        self.name = name
+        self.dir = profile_dir(name)
+        if not os.path.isdir(self.dir):
+            die(f"プロファイル '{name}' がありません（slk profile list）")
+        self._token = None
+        self._team = None
+        self._users = None
+        self._channels = None
+
+    @property
+    def token(self):
+        if self._token is None:
+            self._token = (keychain_get(self.name) if keychain_ok() else None) or file_token(self.dir)
+            if not self._token:
+                die(f"プロファイル '{self.name}' のトークンが Keychain にも "
+                    f"{os.path.join(self.dir, 'env')} にもありません"
+                    f"（slk profile add {self.name} で登録）")
+        return self._token
+
+    def call(self, method, params=None):
+        return call(self.token, method, params)
+
+    def team(self):
+        if self._team is None:
+            path = os.path.join(self.dir, "team.json")
+            self._team = json.load(open(path)) if os.path.exists(path) else {}
+        return self._team
+
+    def domain(self):
+        return self.team().get("domain") or "app"
+
+    def banner(self):
+        if G.get("--quiet") or not human():
+            return
+        t = self.team()
+        who = t.get("user") or "?"
+        note(f"workspace: {self.name} ({t.get('team', '?')} / {who})")
+
+    # --- cache
+    def _cache_path(self, kind):
+        return os.path.join(self.dir, "cache", f"{kind}.json")
+
+    def _cache_read(self, kind):
+        path = self._cache_path(kind)
+        if not os.path.exists(path):
+            return {"ts": 0, "items": {}}
+        try:
+            blob = json.load(open(path))
+        except ValueError:
+            return {"ts": 0, "items": {}}
+        blob.setdefault("ts", 0)
+        blob.setdefault("items", {})
+        return blob
+
+    def _cache_write(self, kind, blob):
+        path = self._cache_path(kind)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(blob, f, ensure_ascii=False)
+        os.replace(tmp, path)
+
+    def _merge(self, kind, key, value):
+        """id 解決の 1 件を足すだけ。ts は動かさない（動かすと一覧が永久に再取得されない）。"""
+        blob = self._cache_read(kind)
+        blob["items"][key] = value
+        self._cache_write(kind, blob)
+        return value
+
+    def user_index(self, refresh=False):
+        if self._users is None or refresh:
+            blob = self._cache_read("users")
+            if refresh or time.time() - blob["ts"] > LIST_TTL:
+                items = {}
+                for u in paginate(self, "users.list", {"limit": 200}, "members"):
+                    items[u["id"]] = user_row(u)
+                blob = {"ts": time.time(), "items": items}
+                self._cache_write("users", blob)
+            self._users = blob["items"]
+        return self._users
+
+    def channel_index(self, refresh=False):
+        if self._channels is None or refresh:
+            blob = self._cache_read("channels")
+            if refresh or time.time() - blob["ts"] > LIST_TTL:
+                items = {}
+                params = {"limit": 1000, "types": "public_channel,private_channel,mpim,im",
+                          "exclude_archived": False}
+                for c in paginate(self, "conversations.list", params, "channels"):
+                    items[c["id"]] = channel_row(c)
+                blob = {"ts": time.time(), "items": items}
+                self._cache_write("channels", blob)
+            self._channels = blob["items"]
+        return self._channels
+
+    def user_name(self, uid):
+        items = self._users if self._users is not None else self._cache_read("users")["items"]
+        row = items.get(uid)
+        if row is None and not items:
+            # 1 件も持っていない状態で 1 件ずつ users.info を叩くと DM 一覧だけで数十回になる
+            row = self.user_index().get(uid)
+        if row is None:
+            try:
+                row = user_row(self.call("users.info", {"user": uid})["user"])
+            except SystemExit:
+                return uid
+            self._merge("users", uid, row)
+            if self._users is not None:
+                self._users[uid] = row
+        return row.get("name") or uid
+
+    def bot_name(self, bot_id):
+        items = self._cache_read("bots")["items"]
+        row = items.get(bot_id)
+        if row is None:
+            try:
+                row = {"name": (self.call("bots.info", {"bot": bot_id})["bot"] or {}).get("name") or bot_id}
+            except SystemExit:
+                row = {"name": bot_id}
+            self._merge("bots", bot_id, row)
+        return row["name"]
+
+    def channel_name(self, cid):
+        items = self._channels if self._channels is not None else self._cache_read("channels")["items"]
+        row = items.get(cid)
+        if row is None and not items:
+            row = self.channel_index().get(cid)
+        if row is None:
+            try:
+                row = channel_row(self.call("conversations.info", {"channel": cid})["channel"])
+            except SystemExit:
+                return cid
+            self._merge("channels", cid, row)
+            if self._channels is not None:
+                self._channels[cid] = row
+        return self.display_channel(cid, row)
+
+    def display_channel(self, cid, row=None):
+        row = row or self._cache_read("channels")["items"].get(cid) or {}
+        if row.get("type") == "im":
+            return "@" + (self.user_name(row["user"]) if row.get("user") else cid)
+        return "#" + (row.get("name") or cid)
+
+    # --- 解決
+    def resolve_user(self, spec):
+        if ID_RE.match(spec):
+            return spec
+        if "@" in spec and "." in spec.split("@")[-1]:
+            return self.call("users.lookupByEmail", {"email": spec})["user"]["id"]
+        needle = spec.lstrip("@").lower()
+        items = self.user_index()
+        exact = [uid for uid, r in items.items()
+                 if needle in (str(r.get("name", "")).lower(), str(r.get("real", "")).lower())]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            die("複数のユーザーが一致します: " + ", ".join(items[u]["name"] for u in exact[:10]))
+        part = [uid for uid, r in items.items() if not r.get("deleted")
+                and (needle in str(r.get("name", "")).lower() or needle in str(r.get("real", "")).lower())]
+        if len(part) == 1:
+            return part[0]
+        if not part:
+            die(f"ユーザーが見つかりません: {spec}")
+        die("複数のユーザーが一致します: " + ", ".join(items[u]["name"] for u in part[:10]))
+
+    def resolve_channel(self, spec):
+        if ID_RE.match(spec):
+            return spec
+        if spec.startswith("@"):
+            uid = self.resolve_user(spec)
+            for cid, r in self.channel_index().items():
+                if r.get("type") == "im" and r.get("user") == uid:
+                    return cid
+            die(f"{spec} との DM が見つかりません")
+        needle = spec.lstrip("#").lower()
+        items = self.channel_index()
+        exact = [cid for cid, r in items.items() if str(r.get("name", "")).lower() == needle]
+        if len(exact) == 1:
+            return exact[0]
+        part = [cid for cid, r in items.items() if needle in str(r.get("name", "")).lower()]
+        if len(part) == 1:
+            note(f"'{spec}' → {self.display_channel(part[0])}")
+            return part[0]
+        if not part:
+            die(f"チャンネルが見つかりません: {spec}（slk cache refresh で一覧を更新）")
+        die("複数のチャンネルが一致します: " + ", ".join(self.display_channel(c) for c in part[:10]))
+
+    # --- 整形
+    def expand(self, text):
+        if not text:
+            return ""
+        def sub(m):
+            kind, ident, label = m.group(1), m.group(2), m.group(3)
+            if kind == "!":
+                return "@" + (label.lstrip("@") if label else ident.split("^")[0])
+            if label:
+                return ("@" if kind == "@" else "#") + label.lstrip("@#")
+            if kind == "@":
+                return "@" + self.user_name(ident)
+            return self.channel_name(ident)
+        s = MENTION_RE.sub(sub, text)
+        s = ANGLE_RE.sub(lambda m: m.group(2) or m.group(1), s)
+        return html.unescape(s)
+
+    def permalink(self, cid, ts, thread_ts=None):
+        p = "p" + str(ts).replace(".", "")
+        url = f"https://{self.domain()}.slack.com/archives/{cid}/{p}"
+        if thread_ts and thread_ts != ts:
+            url += f"?thread_ts={thread_ts}&cid={cid}"
+        return url
+
+    # --- 読み取り
+    def messages_before(self, cid, ts, n):
+        """ts より前の n 件（古い順）。入退室を落とした後の件数で数えるので、
+        足りなければカーソルでさらに遡る。"""
+        got, params = [], {"channel": cid, "latest": ts, "inclusive": False, "limit": max(n * 3, 30)}
+        for _ in range(10):
+            res = self.call("conversations.history", params)
+            got.extend(drop_system(res.get("messages") or []))
+            cursor = (res.get("response_metadata") or {}).get("next_cursor")
+            if len(got) >= n or not res.get("has_more") or not cursor:
+                break
+            params["cursor"] = cursor
+            # 入退室ばかりのチャンネルだと 1 ページの実収穫が数件になるので、遡るほど広く取る
+            params["limit"] = min(1000, params["limit"] * 4)
+        return list(reversed(got[:n]))
+
+    def messages_after(self, cid, ts, n):
+        """ts より後ろの n 件（古い順）。
+
+        history は latest から過去へ向かってしか読めないので、[ts, ts+span] の窓を
+        「取り切った」状態にしないと、返ってくるのは窓の中の**新しい方**の n 件になり、
+        ts の直後の n 件にならない。has_more が立っている間は取り切れていないので
+        件数を増やし、取り切ったうえで足りなければ窓を広げる。"""
+        span, limit, got = 300, max(n * 3, 30), []
+        for _ in range(10):
+            res = self.call("conversations.history", {
+                "channel": cid, "oldest": ts, "latest": float(ts) + span,
+                "inclusive": False, "limit": limit})
+            msgs = [m for m in (res.get("messages") or []) if float(m.get("ts", 0)) > float(ts)]
+            if res.get("has_more"):
+                if limit < 1000:
+                    limit = min(1000, limit * 4)
+                else:
+                    span = max(60, span // 4)
+                continue
+            got = drop_system(list(reversed(msgs)))
+            if len(got) >= n or span > 63072000:
+                break
+            span *= 6
+        return got[:n]
+
+
+def user_row(u):
+    p = u.get("profile") or {}
+    return {"name": u.get("name") or p.get("display_name") or u.get("id"),
+            "real": p.get("real_name") or u.get("real_name") or "",
+            "email": p.get("email") or "",
+            "bot": bool(u.get("is_bot")) or u.get("id") == "USLACKBOT",
+            "deleted": bool(u.get("deleted"))}
+
+
+def channel_row(c):
+    kind = ("im" if c.get("is_im") else "mpim" if c.get("is_mpim")
+            else "private" if c.get("is_private") else "public")
+    return {"name": c.get("name") or "", "type": kind,
+            "archived": bool(c.get("is_archived")), "member": bool(c.get("is_member")),
+            "num": c.get("num_members"), "user": c.get("user"),
+            "topic": ((c.get("topic") or {}).get("value") or "")[:120]}
+
+
+def paginate(prof, method, params, key, cap=None):
+    """cursor 方式の一覧をまとめて取る。"""
+    rows, params = [], dict(params)
+    while True:
+        res = prof.call(method, params)
+        rows.extend(res.get(key) or [])
+        if cap and len(rows) >= cap:
+            return rows[:cap]
+        cursor = (res.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            return rows
+        params["cursor"] = cursor
+        if len(rows) >= 1000:
+            note(f"{method}: {len(rows)} 件 …")
+
+
+# --- 表示 -------------------------------------------------------------------
+
+SYSTEM_SUBTYPES = ("channel_join", "channel_leave", "group_join", "group_leave")
+
+
+def drop_system(msgs):
+    return [m for m in msgs if m.get("subtype") not in SYSTEM_SUBTYPES]
+
+
+def message_text(m):
+    t = (m.get("text") or "").strip()
+    if not t:
+        for a in m.get("attachments") or []:
+            t = (a.get("fallback") or a.get("text") or a.get("title") or "").strip()
+            if t:
+                break
+    if not t and m.get("files"):
+        t = "[ファイル] " + ", ".join(f.get("name") or "?" for f in m["files"])
+    if not t and m.get("blocks"):
+        t = "[本文なし（blocks のみ）]"
+    return t
+
+
+def author(prof, m):
+    if m.get("username"):
+        return m["username"]
+    if m.get("user"):
+        return prof.user_name(m["user"])
+    if m.get("bot_id"):
+        return prof.bot_name(m["bot_id"])
+    return "?"
+
+
+def print_message(prof, m, channel=None, link=None, indent=""):
+    head = [x for x in (channel, fmt_ts(m.get("ts")), author(prof, m)) if x]
+    print(indent + "  ".join(head))
+    body = prof.expand(message_text(m))
+    for line in (body.splitlines() or [""]):
+        print(f"{indent}  {line}")
+    n = m.get("reply_count")
+    if n and m.get("thread_ts") == m.get("ts"):
+        print(f"{indent}  ↳ スレッドに {n} 件の返信")
+    if link:
+        print(f"{indent}  {link}")
+    print()
+
+
+def msg_dict(prof, m, cid=None, channel=None, permalink=None):
+    return {"channel": channel, "channel_id": cid,
+            "ts": m.get("ts"), "time": fmt_ts(m.get("ts")),
+            "user": author(prof, m), "user_id": m.get("user"),
+            "text": prof.expand(message_text(m)),
+            "thread_ts": m.get("thread_ts"), "reply_count": m.get("reply_count"),
+            "permalink": permalink or (prof.permalink(cid, m.get("ts"), m.get("thread_ts")) if cid else None)}
+
+
+# --- コマンド ---------------------------------------------------------------
+
+def cmd_search(prof, args):
+    opts, rest = take_opts(args, {"--in": True, "--from": True, "--after": True, "--before": True,
+                                  "--on": True, "--limit": True, "--all": False, "--sort": True,
+                                  "--asc": False, "--files": False})
+    if not rest:
+        die('usage: slk search "<query>" [--in #ch] [--from @user] [--after YYYY-MM-DD] [--limit N|--all]')
+    q = " ".join(rest)
+    if opts.get("--in"):
+        v = opts["--in"]
+        q += " in:" + (f"<#{v}>" if ID_RE.match(v) else v if v.startswith(("#", "@", "<")) else "#" + v)
+    if opts.get("--from"):
+        v = opts["--from"]
+        q += " from:" + (f"<@{v}>" if ID_RE.match(v) else v if v.startswith(("@", "<")) else "@" + v)
+    for flag, op in (("--after", "after"), ("--before", "before"), ("--on", "on")):
+        if opts.get(flag):
+            q += f" {op}:{opts[flag]}"
+
+    method = "search.files" if opts.get("--files") else "search.messages"
+    key = "files" if opts.get("--files") else "messages"
+    want = None if opts.get("--all") else int(opts.get("--limit", 20))
+    params = {"query": q, "sort": opts.get("--sort", "score"),
+              "sort_dir": "asc" if opts.get("--asc") else "desc", "highlight": False}
+
+    prof.banner()
+    matches, page, total, pages = [], 1, None, 1
+    while True:
+        params["count"] = min(100, want - len(matches)) if want else 100
+        params["page"] = page
+        res = prof.call(method, params)
+        block = res.get(key) or {}
+        total = block.get("total")
+        pages = (block.get("paging") or {}).get("pages") or 1
+        matches.extend(block.get("matches") or [])
+        if G.get("--raw") and page == 1 and not opts.get("--all"):
+            out_json(res)
+            return
+        if want and len(matches) >= want:
+            matches = matches[:want]
+            break
+        if page >= pages:
+            break
+        page += 1
+        note(f"{len(matches)} 件 …")
+
+    if G.get("--raw"):
+        out_json({"query": q, "total": total, "matches": matches})
+        return
+    if opts.get("--files"):
+        rows = [{"name": m.get("name"), "title": m.get("title"),
+                 "user": m.get("username") or (prof.user_name(m["user"]) if m.get("user") else "?"),
+                 "time": fmt_ts(m.get("timestamp")), "permalink": m.get("permalink")} for m in matches]
+        if G.get("--json"):
+            out_json(rows)
+            return
+        note(f"query: {q}  /  {len(rows)} 件 (全 {total} 件)")
+        for r in rows:
+            print(f"{r['time']}  {r['user']}  {r['name']}\n  {r['permalink']}\n")
+        return
+
+    if G.get("--json"):
+        out_json([msg_dict(prof, m, (m.get("channel") or {}).get("id"),
+                           "#" + ((m.get("channel") or {}).get("name") or "?"), m.get("permalink"))
+                  for m in matches])
+        return
+    note(f"query: {q}  /  {len(matches)} 件 (全 {total} 件)")
+    for m in matches:
+        ch = "#" + ((m.get("channel") or {}).get("name") or "?")
+        print_message(prof, m, channel=ch, link=m.get("permalink"))
+
+
+def cmd_ask(prof, args):
+    opts, rest = take_opts(args, {"--in": True, "--limit": True, "--context": False,
+                                  "--types": True, "--channels": True,
+                                  "--after": True, "--before": True})
+    if not rest:
+        die('usage: slk ask "<キーワード>" [--in #ch] [--context] [--types messages,channels,files]\n'
+            '    文章を丸ごと渡すと 0 件になる（キーワード一致のため）')
+    params = {"query": " ".join(rest),
+              "limit": min(20, int(opts.get("--limit", 20))),
+              "content_types": opts.get("--types", "messages"),
+              "include_context_messages": bool(opts.get("--context"))}
+    if opts.get("--channels"):
+        params["channel_types"] = opts["--channels"]
+    if opts.get("--in"):
+        params["context_channel_id"] = prof.resolve_channel(opts["--in"])
+    for flag, name in (("--after", "after"), ("--before", "before")):
+        if opts.get(flag):
+            params[name] = int(to_epoch(opts[flag]))
+
+    prof.banner()
+    res = prof.call("assistant.search.context", params)
+    if G.get("--raw"):
+        out_json(res)
+        return
+    results = res.get("results") or {}
+    msgs = results.get("messages") or []
+    chans = results.get("channels") or []
+    files = results.get("files") or []
+    if G.get("--json"):
+        out_json(results)
+        return
+    if not (msgs or chans or files):
+        note("0 件（Real-time Search API の応答形が想定と違う場合は --raw で確認）")
+        return
+    for m in msgs:
+        ch = m.get("channel_name")
+        head = f"#{ch}" if ch and not str(ch).startswith("#") else (ch or "?")
+        print(f"{head}  {fmt_ts(m.get('message_ts'))}  {m.get('author_name') or '?'}")
+        for line in prof.expand(m.get("content") or "").splitlines() or [""]:
+            print("  " + line)
+        ctx = m.get("context_messages") or {}
+        for side, label in (("before", "前"), ("after", "後")):
+            for c in ctx.get(side) or []:
+                who = c.get("author_name") or "?"
+                print(f"    [{label}] {who}: {prof.expand(c.get('content') or '')[:200]}")
+        if m.get("permalink"):
+            print("  " + m["permalink"])
+        print()
+    for c in chans:
+        print(f"#{c.get('name') or c.get('channel_name') or c.get('id')}  "
+              f"{(c.get('description') or c.get('purpose') or '')[:100]}")
+    for f in files:
+        print(f"[ファイル] {f.get('name') or f.get('title')}  {f.get('permalink') or ''}")
+
+
+def cmd_channels(prof, args):
+    opts, rest = take_opts(args, {"--private": False, "--public": False, "--dm": False,
+                                  "--archived": False, "--member": False, "--refresh": False,
+                                  "--limit": True})
+    prof.banner()
+    items = prof.channel_index(refresh=opts.get("--refresh", False))
+    needle = (rest[0].lstrip("#@").lower() if rest else "")
+    kinds = set()
+    if opts.get("--public"):
+        kinds.add("public")
+    if opts.get("--private"):
+        kinds.add("private")
+    if opts.get("--dm"):
+        kinds |= {"im", "mpim"}
+    rows = []
+    for cid, r in items.items():
+        if kinds and r.get("type") not in kinds:
+            continue
+        if not kinds and r.get("type") in ("im", "mpim"):
+            continue
+        if r.get("archived") and not opts.get("--archived"):
+            continue
+        if opts.get("--member") and not r.get("member"):
+            continue
+        name = prof.display_channel(cid, r)
+        if needle and needle not in name.lower() and needle not in (r.get("topic") or "").lower():
+            continue
+        rows.append({"id": cid, "name": name, "type": r.get("type"),
+                     "members": r.get("num"), "joined": bool(r.get("member")),
+                     "archived": bool(r.get("archived")), "topic": r.get("topic") or ""})
+    rows.sort(key=lambda r: r["name"])
+    if opts.get("--limit"):
+        rows = rows[:int(opts["--limit"])]
+    if not human():
+        out_json(rows)
+        return
+    note(f"{len(rows)} 件")
+    width = max([len(r["name"]) for r in rows] + [10])
+    for r in rows:
+        marks = ("*" if r["joined"] else " ") + ("A" if r["archived"] else " ")
+        num = f"{r['members']}名" if r["members"] is not None else ""
+        print(f"{marks} {r['name']:<{width}}  {r['id']}  {r['type']:<7} {num:>7}  {r['topic'][:60]}")
+
+
+def cmd_users(prof, args):
+    opts, rest = take_opts(args, {"--email": True, "--refresh": False, "--bots": False,
+                                  "--deleted": False, "--limit": True})
+    prof.banner()
+    if opts.get("--email"):
+        u = prof.call("users.lookupByEmail", {"email": opts["--email"]})["user"]
+        rows = [dict(user_row(u), id=u["id"])]
+    else:
+        items = prof.user_index(refresh=opts.get("--refresh", False))
+        needle = (rest[0].lstrip("@").lower() if rest else "")
+        rows = []
+        for uid, r in items.items():
+            if r.get("deleted") and not opts.get("--deleted"):
+                continue
+            if r.get("bot") and not opts.get("--bots"):
+                continue
+            blob = f"{r.get('name')} {r.get('real')} {r.get('email')}".lower()
+            if needle and needle not in blob:
+                continue
+            rows.append(dict(r, id=uid))
+        rows.sort(key=lambda r: r["name"])
+    if opts.get("--limit"):
+        rows = rows[:int(opts["--limit"])]
+    if not human():
+        out_json(rows)
+        return
+    note(f"{len(rows)} 件")
+    width = max([len(r["name"]) for r in rows] + [8])
+    for r in rows:
+        print(f"@{r['name']:<{width}}  {r['id']}  {r.get('real', ''):<16}  {r.get('email', '')}")
+
+
+def cmd_members(prof, args):
+    if not args:
+        die("usage: slk members <#channel>")
+    cid = prof.resolve_channel(args[0])
+    prof.banner()
+    ids = paginate(prof, "conversations.members", {"channel": cid, "limit": 1000}, "members")
+    names = sorted(prof.user_name(u) for u in ids)
+    if not human():
+        out_json([{"id": u, "name": prof.user_name(u)} for u in ids])
+        return
+    note(f"{prof.display_channel(cid)}: {len(names)} 名")
+    for n in names:
+        print("@" + n)
+
+
+def cmd_history(prof, args):
+    opts, rest = take_opts(args, {"--limit": True, "--after": True, "--before": True, "--threads": False})
+    if not rest:
+        die("usage: slk history <#channel|@user> [--limit N] [--after YYYY-MM-DD] [--before ...]")
+    cid = prof.resolve_channel(rest[0])
+    limit = int(opts.get("--limit", 50))
+    params = {"channel": cid, "limit": min(1000, limit)}
+    if opts.get("--after"):
+        params["oldest"] = to_epoch(opts["--after"])
+    if opts.get("--before"):
+        params["latest"] = to_epoch(opts["--before"])
+    prof.banner()
+    res = prof.call("conversations.history", params)
+    if G.get("--raw"):
+        out_json(res)
+        return
+    msgs = drop_system(list(reversed(res.get("messages") or [])))[:limit]
+    name = prof.display_channel(cid)
+    if G.get("--json"):
+        out_json([msg_dict(prof, m, cid, name) for m in msgs])
+        return
+    note(f"{name}: {len(msgs)} 件（古い順）")
+    for m in msgs:
+        print_message(prof, m, channel=None, link=prof.permalink(cid, m.get("ts")))
+        if opts.get("--threads") and m.get("reply_count"):
+            for r in prof.call("conversations.replies", {"channel": cid, "ts": m["ts"], "limit": 100})["messages"][1:]:
+                print_message(prof, r, channel=None, indent="    ")
+
+
+def parse_url(url):
+    m = ARCHIVE_RE.search(url)
+    if not m:
+        return None
+    cid, ts = m.group(1), f"{m.group(2)}.{m.group(3)}"
+    qs = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    return cid, ts, (qs.get("thread_ts") or [None])[0]
+
+
+def cmd_thread(prof, args):
+    if not args:
+        die("usage: slk thread <permalink> | slk thread <#channel> <ts>")
+    parsed = parse_url(args[0])
+    if parsed:
+        cid, ts, thread_ts = parsed
+        ts = thread_ts or ts
+    else:
+        if len(args) < 2:
+            die("usage: slk thread <#channel> <ts>")
+        cid, ts = prof.resolve_channel(args[0]), args[1]
+    prof.banner()
+    res = prof.call("conversations.replies", {"channel": cid, "ts": ts, "limit": 200})
+    if G.get("--raw"):
+        out_json(res)
+        return
+    msgs = res.get("messages") or []
+    name = prof.display_channel(cid)
+    if G.get("--json"):
+        out_json([msg_dict(prof, m, cid, name) for m in msgs])
+        return
+    note(f"{name}: スレッド {len(msgs)} 件")
+    for i, m in enumerate(msgs):
+        print_message(prof, m, channel=None, indent="" if i == 0 else "  ",
+                      link=prof.permalink(cid, m.get("ts"), ts) if i == 0 else None)
+
+
+def cmd_read(prof, args):
+    opts, rest = take_opts(args, {"--context": True, "--thread": False})
+    if not rest:
+        die("usage: slk read <slack の URL> [--context N]")
+    parsed = parse_url(rest[0])
+    if not parsed:
+        die("Slack のメッセージ URL ではありません（…/archives/C…/p… の形）")
+    cid, ts, thread_ts = parsed
+    n = int(opts.get("--context", 0))
+    prof.banner()
+    res = prof.call("conversations.history",
+                    {"channel": cid, "latest": ts, "oldest": ts, "inclusive": True, "limit": 1})
+    target = (res.get("messages") or [None])[0]
+    if target is None:
+        die("メッセージが見つかりません（削除済みか、そのチャンネルを読む権限がない）")
+    name = prof.display_channel(cid)
+    before = prof.messages_before(cid, ts, n) if n else []
+    after = prof.messages_after(cid, ts, n) if n else []
+    if not human():
+        payload = {"channel": name, "message": msg_dict(prof, target, cid, name),
+                   "before": [msg_dict(prof, m, cid, name) for m in before],
+                   "after": [msg_dict(prof, m, cid, name) for m in after]}
+        if G.get("--raw"):
+            payload["raw"] = target
+        out_json(payload)
+        return
+    note(f"{name}")
+    for m in before:
+        print_message(prof, m, indent="  ")
+    print_message(prof, target, link=prof.permalink(cid, ts, thread_ts))
+    for m in after:
+        print_message(prof, m, indent="  ")
+    if target.get("reply_count") or thread_ts:
+        root = thread_ts or target.get("thread_ts") or ts
+        replies = prof.call("conversations.replies", {"channel": cid, "ts": root, "limit": 200})["messages"]
+        note(f"スレッド {len(replies)} 件")
+        for r in replies[1:]:
+            print_message(prof, r, indent="    ")
+
+
+def cmd_cache(prof, args):
+    sub = (args[0] if args else "refresh")
+    if sub == "clear":
+        path = os.path.join(prof.dir, "cache")
+        for f in os.listdir(path) if os.path.isdir(path) else []:
+            os.remove(os.path.join(path, f))
+        print(f"{prof.name}: キャッシュを削除しました")
+    elif sub == "refresh":
+        u = prof.user_index(refresh=True)
+        c = prof.channel_index(refresh=True)
+        print(f"{prof.name}: ユーザー {len(u)} 件 / チャンネル {len(c)} 件を取得しました")
+    else:
+        die("usage: slk cache [refresh|clear]")
+
+
+def cmd_whoami(prof, args):
+    res = prof.call("auth.test")
+    info = {"profile": prof.name, "team": res.get("team"), "team_id": res.get("team_id"),
+            "user": res.get("user"), "user_id": res.get("user_id"), "url": res.get("url")}
+    save_team(prof.dir, res)
+    if not human():
+        out_json(info)
+        return
+    for k, v in info.items():
+        print(f"{k:<8} {v}")
+
+
+def cmd_api(prof, args):
+    opts, rest = take_opts(args, {"--all": False, "--key": True})
+    if not rest or rest[0] in ("help", "-h", "--help"):
+        print("usage: slk api <method> [key=value ...] [--all] [--key <一覧のキー>]\n\n呼べるメソッド:")
+        for m in sorted(READ_METHODS):
+            print("  " + m)
+        return
+    method, params = rest[0], {}
+    for a in rest[1:]:
+        if "=" not in a:
+            die(f"不正な引数: {a}（key=value 形式）")
+        k, v = a.split("=", 1)
+        params[k] = v
+    if not opts.get("--all"):
+        out_json(prof.call(method, params))
+        return
+    key = opts.get("--key")
+    if not key:
+        probe = prof.call(method, dict(params, limit=params.get("limit", 200)))
+        key = next((k for k, v in probe.items() if isinstance(v, list)), None)
+        if not key:
+            out_json(probe)
+            return
+    rows = paginate(prof, method, dict(params, limit=params.get("limit", 200)), key)
+    out_json({key: rows, "count": len(rows)})
+
+
+# --- profile / setup --------------------------------------------------------
+
+def save_team(dir_, auth):
+    domain = ""
+    m = re.match(r"https?://([^./]+)\.slack\.com", auth.get("url") or "")
+    if m:
+        domain = m.group(1)
+    blob = {"team": auth.get("team"), "team_id": auth.get("team_id"), "domain": domain,
+            "user": auth.get("user"), "user_id": auth.get("user_id")}
+    with open(os.path.join(dir_, "team.json"), "w") as f:
+        json.dump(blob, f, ensure_ascii=False, indent=2)
+    return blob
+
+
+# --- OAuth ログイン ------------------------------------------------------------
+
+def load_app():
+    """OAuth アプリの設定。スクリプトと同じ場所（＝リポジトリ）→ 設定ディレクトリの順に見る。"""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.path.join(here, "app.json"), os.path.join(CONFIG_ROOT, "app.json")):
+        if not os.path.exists(path):
+            continue
+        try:
+            blob = json.load(open(path))
+        except ValueError as e:
+            die(f"{path} が JSON として読めません: {e}")
+        for key in ("client_id", "redirect_uri"):
+            if not blob.get(key):
+                die(f"{path} に {key} がありません")
+        return blob, path
+    die("app.json がありません（リポジトリ同梱のものを使うか、"
+        f"{os.path.join(CONFIG_ROOT, 'app.json')} を作ってください）")
+
+
+def app_secret():
+    sec = keychain_get(APP_SECRET_ACCOUNT) if keychain_ok() else None
+    if sec:
+        return sec
+    if not sys.stdin.isatty():
+        die("client_secret が Keychain にありません。対話環境で slk login を 1 度実行してください")
+    note("アプリの client_secret を 1 度だけ登録します（Keychain に入り、次回から聞きません）")
+    sec = getpass.getpass("client_secret: ").strip()
+    if not sec:
+        die("client_secret が空です")
+    if keychain_ok():
+        ok, err = keychain_set(APP_SECRET_ACCOUNT, sec)
+        if not ok:
+            warn(f"Keychain に保存できませんでした（今回だけ使います）: {err}")
+    return sec
+
+
+def oauth_exchange(app, secret, code):
+    body = urllib.parse.urlencode({
+        "client_id": app["client_id"], "client_secret": secret,
+        "code": code, "redirect_uri": app["redirect_uri"]}).encode()
+    req = urllib.request.Request("https://slack.com/api/oauth.v2.access", data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("User-Agent", USER_AGENT)
+    try:
+        with urllib.request.urlopen(req) as res:
+            blob = json.loads(res.read().decode())
+    except urllib.error.HTTPError as e:
+        die(f"oauth.v2.access -> HTTP {e.code} {e.read().decode()[:300]}")
+    if not blob.get("ok"):
+        hints = {"invalid_code": "コードは 1 度しか使えず数分で失効します。slk login からやり直してください",
+                 "bad_redirect_uri": "app.json の redirect_uri が Slack 側の登録と完全一致していません",
+                 "invalid_client_id": "app.json の client_id が違います"}
+        err = blob.get("error", "?")
+        die(f"トークン交換に失敗しました: {err}" + (f"（{hints[err]}）" if err in hints else ""))
+    token = (blob.get("authed_user") or {}).get("access_token")
+    if not token:
+        die("user token が返りませんでした（認可 URL の user_scope を確認してください）")
+    return token
+
+
+class _Catcher(http.server.BaseHTTPRequestHandler):
+    """着地ページの JS から投げ返される 1 リクエストだけを拾う。"""
+    result = None
+
+    def do_GET(self):
+        q = {k: v[0] for k, v in
+             urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).items()}
+        if "code" not in q and "error" not in q:
+            self.send_response(404)
+            self.end_headers()
+            return
+        _Catcher.result = q
+        page = ("<!doctype html><meta charset=utf-8><title>slk</title>"
+                "<p style='font:16px system-ui;padding:2rem'>"
+                "認証できました。ターミナルに戻ってください。</p>").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        self.wfile.write(page)
+
+    def log_message(self, *a):
+        pass
+
+
+def serve_once(srv, timeout):
+    _Catcher.result = None
+    srv.timeout = 1
+    deadline = time.time() + timeout
+    while time.time() < deadline and _Catcher.result is None:
+        srv.handle_request()
+    srv.server_close()
+    return _Catcher.result
+
+
+def parse_pasted(raw):
+    raw = raw.strip()
+    if not raw:
+        die("入力が空です")
+    if raw.startswith("http") or "?" in raw:
+        return {k: v[0] for k, v in
+                urllib.parse.parse_qs(urllib.parse.urlsplit(raw).query).items()}
+    return {"code": raw}
+
+
+def install_token(name, token, auth, quiet=False):
+    """プロファイルを作ってトークンを保存する。profile add と login の共通処理。"""
+    dir_ = profile_dir(name)
+    os.makedirs(os.path.join(dir_, "cache"), exist_ok=True)
+    os.chmod(PROFILE_ROOT, 0o700)
+    os.chmod(dir_, 0o700)
+    stored, err = keychain_set(name, token) if keychain_ok() else (False, "macOS の security が使えません")
+    if stored:
+        write_env_stub(dir_)
+        if not quiet:
+            print(f"トークンは Keychain に保存しました（service={KEYCHAIN_SERVICE} / account={name}）")
+    else:
+        env_path = os.path.join(dir_, "env")
+        with open(env_path, "w") as f:
+            f.write(f"SLACK_USER_TOKEN={token}\n")
+        os.chmod(env_path, 0o600)
+        warn(f"Keychain に保存できなかったので {env_path} に平文で置きました: {err}")
+    blob = save_team(dir_, auth)
+    with open(os.path.join(dir_, ".label"), "w") as f:
+        f.write(f"{blob['team']} ({blob['user']})\n")
+    if not os.path.exists(ACTIVE_FILE):
+        os.makedirs(CONFIG_ROOT, exist_ok=True)
+        with open(ACTIVE_FILE, "w") as f:
+            f.write(name + "\n")
+        print(f"有効なプロファイルにしました（切り替えは slk profile use <name>）")
+    return blob
+
+
+def cmd_login(args):
+    opts, rest = take_opts(args, {"--manual": False, "--timeout": True})
+    app, app_path = load_app()
+    secret = app_secret()
+    nonce = secrets.token_urlsafe(16)
+
+    srv = None
+    if not opts.get("--manual"):
+        try:
+            srv = http.server.HTTPServer(("127.0.0.1", 0), _Catcher)
+        except OSError as e:
+            warn(f"ローカルの受け口を開けませんでした（貼り付け方式にします）: {e}")
+    # 着地ページは state の先頭からポートを読んでここへ投げ返す。0 なら貼り付け方式
+    state = f"{srv.server_port if srv else 0}.{nonce}"
+    url = AUTHORIZE_URL + "?" + urllib.parse.urlencode({
+        "client_id": app["client_id"],
+        "user_scope": ",".join(app.get("user_scopes") or USER_SCOPES),
+        "redirect_uri": app["redirect_uri"],
+        "state": state})
+
+    note(f"設定: {app_path}")
+    note("ブラウザで承認してください。開かない場合は次の URL を開いてください:")
+    print(url, file=sys.stderr)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+    got = None
+    if srv:
+        got = serve_once(srv, int(opts.get("--timeout", 300)))
+        if got is None:
+            warn("ブラウザから自動で受け取れませんでした。貼り付けに切り替えます")
+    if got is None:
+        if not sys.stdin.isatty():
+            die("対話環境ではないので貼り付けができません")
+        got = parse_pasted(input("着地したページの URL（または code）を貼ってください: "))
+
+    if got.get("error"):
+        die(f"承認されませんでした: {got['error']}")
+    if "state" in got:
+        if got["state"] != state:
+            die("state が一致しません。別の認証の応答かもしれないので中断しました")
+    else:
+        warn("state を検証できませんでした（code だけを貼った場合はこの警告が出ます）")
+    if not got.get("code"):
+        die("code が取れませんでした")
+
+    token = oauth_exchange(app, secret, got["code"])
+    auth = call(token, "auth.test")
+    name = rest[0] if rest else None
+    if not name:
+        m = re.match(r"https?://([^./]+)\.slack\.com", auth.get("url") or "")
+        name = m.group(1) if m else "default"
+    if not NAME_RE.match(name):
+        die(f"プロファイル名に使えない文字が含まれています: {name}")
+    existing = os.path.isdir(os.path.join(PROFILE_ROOT, name))
+    blob = install_token(name, token, auth)
+    print(f"プロファイル '{name}' を{'更新' if existing else '作成'}しました: "
+          f"{blob['team']} / {blob['user']}")
+
+
+def cmd_manifest(args):
+    opts, _ = take_opts(args, {"--name": True, "--search": True})
+    scopes = list(USER_SCOPES)
+    mode = opts.get("--search", "both")
+    if mode == "legacy":
+        scopes = [s for s in scopes if not s.startswith("search:read.")]
+    elif mode == "rts":
+        scopes = [s for s in scopes if s != "search:read"]
+    elif mode != "both":
+        die("--search は legacy | rts | both")
+    out_json({
+        "display_information": {"name": opts.get("--name", "slk (read-only)"),
+                                "description": "個人用の read-only Slack CLI"},
+        "oauth_config": {"scopes": {"user": scopes}},
+        "settings": {"org_deploy_enabled": False, "socket_mode_enabled": False,
+                     "token_rotation_enabled": False},
+    })
+    sys.stdout.flush()
+    note("手順:")
+    note("  1. https://api.slack.com/apps → Create New App → From a manifest")
+    note("  2. ワークスペースを選び、上の JSON を貼る")
+    note("  3. Install to Workspace → User OAuth Token (xoxp-) をコピー")
+    note("  4. slk profile add <name> でトークンを登録")
+    note("Distribution は有効にしないこと（履歴 API が 15 件/分に落ちる。戻せない）")
+    if mode == "both":
+        note("scope の組み合わせが拒否されたら --search legacy か --search rts で作り直す")
+
+
+def cmd_profile(args):
+    sub = (args[0] if args else "list")
+    rest = args[1:]
+
+    if sub in ("list", "ls"):
+        names = list_profiles()
+        if not names:
+            print("プロファイルがありません（slk manifest → slk profile add <name>）")
+            return
+        active = None
+        if os.path.exists(ACTIVE_FILE):
+            active = open(ACTIVE_FILE).readline().strip()
+        elif len(names) == 1:
+            active = names[0]
+        for n in names:
+            label_path = os.path.join(PROFILE_ROOT, n, ".label")
+            label = open(label_path).readline().strip() if os.path.exists(label_path) else ""
+            where = token_where(n)
+            if where is None:
+                label = (label + " (未認証)").strip()
+            elif where == "file":
+                label = (label + " (トークンが平文ファイル: slk profile keychain " + n + ")").strip()
+            print(f"{'*' if n == active else ' '} {n:<12} {label}")
+        return
+
+    if sub == "current":
+        print(active_name())
+        return
+
+    if sub == "use":
+        if not rest:
+            die("usage: slk profile use <name>")
+        name = rest[0]
+        if not os.path.isdir(profile_dir(name)):
+            die(f"プロファイル '{name}' がありません")
+        os.makedirs(CONFIG_ROOT, exist_ok=True)
+        with open(ACTIVE_FILE, "w") as f:
+            f.write(name + "\n")
+        print(f"有効なプロファイル: {name}")
+        if os.environ.get("SLK_PROFILE"):
+            warn(f"環境変数 SLK_PROFILE={os.environ['SLK_PROFILE']} が優先されます")
+        return
+
+    if sub == "add":
+        if not rest:
+            die("usage: slk profile add <name>   (トークンは標準入力から読みます)")
+        name = rest[0]
+        dir_ = profile_dir(name)
+        if os.path.exists(dir_):
+            die(f"プロファイル '{name}' は既にあります")
+        token = os.environ.get("SLK_TOKEN")
+        if not token:
+            if sys.stdin.isatty():
+                token = getpass.getpass("User OAuth Token (xoxp-…): ").strip()
+            else:
+                token = sys.stdin.read().strip()
+        if not token.startswith("xox"):
+            die("Slack のトークンに見えません（xoxp- で始まる User OAuth Token）")
+        if token.startswith("xoxb-"):
+            die("bot token では検索できません。User OAuth Token (xoxp-) を使ってください")
+        auth = call(token, "auth.test")
+        blob = install_token(name, token, auth)
+        print(f"プロファイル '{name}' を作成しました: {blob['team']} / {blob['user']}")
+        return
+
+    if sub == "label":
+        if not rest:
+            die("usage: slk profile label <name> [表示テキスト]")
+        name, text = rest[0], " ".join(rest[1:])
+        dir_ = profile_dir(name)
+        if not os.path.isdir(dir_):
+            die(f"プロファイル '{name}' がありません")
+        if not text:
+            auth = call(Profile(name).token, "auth.test")
+            blob = save_team(dir_, auth)
+            text = f"{blob['team']} ({blob['user']})"
+        with open(os.path.join(dir_, ".label"), "w") as f:
+            f.write(text + "\n")
+        print(f"{name}: {text}")
+        return
+
+    if sub == "keychain":
+        opts, pos = take_opts(rest, {"--force": False})
+        name = pos[0] if pos else active_name()
+        dir_ = profile_dir(name)
+        if not os.path.isdir(dir_):
+            die(f"プロファイル '{name}' がありません")
+        if not keychain_ok():
+            die("macOS の Keychain が使えません（security コマンドが見つかりません）")
+        token, existing = file_token(dir_), keychain_get(name)
+        if existing and not token:
+            print(f"'{name}': 既に Keychain にあります")
+            return
+        if existing and token:
+            if existing == token:
+                write_env_stub(dir_)
+                print(f"'{name}': Keychain に同じ値があったので、env ファイルの平文を消しました")
+                return
+            # Keychain の鍵に設定ディレクトリが入らないので、別の設定ディレクトリの同名
+            # プロファイルや失効済みの古い値が居座っていることがある。どちらが正しいかは
+            # ここでは判定できないので、消さずに止める
+            if not opts.get("--force"):
+                die(f"'{name}': Keychain の値と env ファイルの値が違います。\n"
+                    f"    どちらが有効かはここでは判定できないので、平文は消していません。\n"
+                    f"    env の値で Keychain を上書きしてよければ: "
+                    f"slk profile keychain {name} --force\n"
+                    f"    Keychain 側を残すなら env から SLACK_USER_TOKEN の行を消してください")
+            warn(f"'{name}': Keychain の既存の値を env ファイルの値で上書きします")
+        if not token:
+            die(f"'{name}' に移せるトークンがありません（slk profile add {name} で登録）")
+        stored, err = keychain_set(name, token)
+        if not stored:
+            die(f"Keychain に保存できませんでした: {err}")
+        if keychain_get(name) != token:
+            die("Keychain に書いた値を読み戻せませんでした。env ファイルはそのままにしています")
+        write_env_stub(dir_)
+        print(f"'{name}' のトークンを Keychain に移しました"
+              f"（service={KEYCHAIN_SERVICE} / account={name}）")
+        sys.stdout.flush()
+        note("env ファイルは上書きしましたが、ディスク上の旧データが残る可能性はあります。")
+        note("気になる場合は Slack 側でトークンを再発行してください。")
+        return
+
+    if sub == "path":
+        print(profile_dir(rest[0] if rest else active_name()))
+        return
+
+    if sub in ("rm", "remove"):
+        opts, pos = take_opts(rest, {"-f": False, "--yes": False})
+        if not pos:
+            die("usage: slk profile rm <name> [-f]")
+        name = pos[0]
+        dir_ = profile_dir(name)
+        if not os.path.isdir(dir_):
+            die(f"プロファイル '{name}' がありません")
+        if not (opts.get("-f") or opts.get("--yes")):
+            ans = input(f"{dir_} とトークンを削除します。よろしいですか? [y/N] ").strip().lower()
+            if ans not in ("y", "yes"):
+                die("中止しました")
+        for root, dirs, files in os.walk(dir_, topdown=False):
+            for f in files:
+                os.remove(os.path.join(root, f))
+            for d in dirs:
+                os.rmdir(os.path.join(root, d))
+        os.rmdir(dir_)
+        if keychain_ok():
+            keychain_del(name)
+        if os.path.exists(ACTIVE_FILE) and open(ACTIVE_FILE).readline().strip() == name:
+            os.remove(ACTIVE_FILE)
+        print(f"プロファイル '{name}' を削除しました")
+        return
+
+    die(f"不明なサブコマンド: {sub}"
+        "（slk profile list|current|use|add|keychain|label|path|rm）")
+
+
+USAGE = """usage: slk [--profile <name>] [--json|--raw] [--quiet] <command>
+
+  slk manifest [--search both|legacy|rts]   アプリ作成用の manifest を出す
+  slk login [<profile 名>] [--manual]       ブラウザで承認して自分のトークンを取る
+  slk profile [list|current|use|add|keychain [--force]|label|path|rm]
+  slk whoami                                トークンの持ち主とワークスペース
+
+  slk search "<query>" [--in #ch] [--from @user] [--after 2026-09-01] [--before ...]
+                       [--limit N|--all] [--sort score|timestamp] [--asc] [--files]
+  slk ask "<キーワード>" [--in #ch] [--context] [--types messages,channels,files] [--limit N]
+  slk channels [pattern] [--private|--public|--dm] [--member] [--archived] [--refresh]
+  slk users [pattern] [--email a@b] [--bots] [--deleted] [--refresh]
+  slk members <#channel>
+  slk history <#channel|@user> [--limit N] [--after ...] [--before ...] [--threads]
+  slk thread <permalink | #channel ts>
+  slk read <URL> [--context N]              URL のメッセージを前後・スレッドごと読む
+  slk cache [refresh|clear]
+  slk api <method> [k=v ...] [--all]        allowlist 内の読み取りメソッドだけ
+
+ワークスペースの選択は --profile > SLK_PROFILE > slk profile use の順。
+search は Slack の検索構文をそのまま渡せる（--in / --from / --after は連結するだけの糖衣）。
+ask は前後の文脈ごと取れるが、文章ではなく単語で渡すこと（キーワード一致で、文章は 0 件になる）。"""
+
+
+def main():
+    argv = split_global(sys.argv[1:])
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd, args = argv[0], argv[1:]
+    if cmd == "manifest":
+        return cmd_manifest(args)
+    if cmd == "login":
+        return cmd_login(args)
+    if cmd == "profile":
+        return cmd_profile(args)
+    if cmd == "api" and args and args[0] in ("help", "-h", "--help"):
+        return cmd_api(None, args)
+    prof = Profile(active_name())
+    table = {"search": cmd_search, "ask": cmd_ask, "channels": cmd_channels, "users": cmd_users,
+             "members": cmd_members, "history": cmd_history, "thread": cmd_thread,
+             "read": cmd_read, "cache": cmd_cache, "whoami": cmd_whoami, "api": cmd_api}
+    if cmd not in table:
+        die(f"未知のコマンド: {cmd}\n\n{USAGE}")
+    table[cmd](prof, args)
+
+
+def split_global(argv):
+    spec = {"--profile": True, "--json": False, "--raw": False, "--quiet": False}
+    keep, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        key, inline = (a.split("=", 1) + [None])[:2]
+        if key in spec:
+            if spec[key]:
+                if inline is None:
+                    i += 1
+                    if i >= len(argv):
+                        die(f"{key} には値が必要です")
+                    inline = argv[i]
+                G[key] = inline
+            else:
+                G[key] = True
+        else:
+            keep.append(a)
+        i += 1
+    return keep
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        os._exit(0)

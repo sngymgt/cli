@@ -1,0 +1,24 @@
+#!/bin/sh
+# public repo なので、トークンとワークスペース固有の情報の混入を機械で止める。
+# 履歴に一度入ると fork とキャッシュに残り、取り消せない。
+fail=0
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+# 1. Slack のトークン
+if git diff --cached -U0 | grep -nE '^\+.*xox[baprse]-[A-Za-z0-9]' ; then
+  echo "pre-commit: Slack トークンらしき文字列があります" >&2; fail=1
+fi
+# 2. ワークスペース固有の permalink / ドメイン（api.slack.com と slack.com は除く）
+if git diff --cached -U0 | grep -nE '^\+.*[a-z0-9-]+\.slack\.com' | grep -vE 'api\.slack\.com|//slack\.com|<[a-z_]+>\.slack\.com|example\.slack\.com|\{[^}]*\}\.slack\.com'; then
+  echo "pre-commit: 実在のワークスペース URL があります（例は example.slack.com に）" >&2; fail=1
+fi
+# 3. 取得ログの持ち込み
+for f in $staged; do
+  case "$f" in
+    */env|env) echo "pre-commit: env はコミットしません: $f" >&2; fail=1 ;;
+  esac
+done
+
+[ "$fail" -eq 0 ] || echo "pre-commit: --no-verify で回避できますが、public repo では基本やめてください" >&2
+exit $fail
