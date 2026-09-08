@@ -52,6 +52,9 @@ git -C ~/src/slk config core.hooksPath .githooks
 6. `client_secret` は**コミットしない**。1Password に入れておく（`slk login` の初回に 1 度だけ聞かれ、
    以降は Keychain から読む）
 
+`app.json` は `~/.config/slk/app.json` があればそちらが優先される。別のアプリやワークスペースを
+使う人は、リポジトリを書き換えずに個人側で上書きできる。
+
 scope の組み合わせが Slack に拒否されたら `slk manifest --search legacy` か `--search rts` で作り直す。
 
 ## 認証

@@ -1072,21 +1072,28 @@ def save_team(dir_, auth):
 # --- OAuth ログイン ------------------------------------------------------------
 
 def load_app():
-    """OAuth アプリの設定。スクリプトと同じ場所（＝リポジトリ）→ 設定ディレクトリの順に見る。"""
+    """OAuth アプリの設定。個人の設定ディレクトリ → スクリプトと同じ場所（＝リポジトリ）の順。
+
+    リポジトリ側は配布される共有の既定値なので、個人の上書きが勝つ向きにする。
+    値が空のものは「未記入のひな型」として次の候補へ進む。"""
     here = os.path.dirname(os.path.realpath(__file__))
-    for path in (os.path.join(here, "app.json"), os.path.join(CONFIG_ROOT, "app.json")):
+    blank = []
+    for path in (os.path.join(CONFIG_ROOT, "app.json"), os.path.join(here, "app.json")):
         if not os.path.exists(path):
             continue
         try:
             blob = json.load(open(path))
         except ValueError as e:
             die(f"{path} が JSON として読めません: {e}")
-        for key in ("client_id", "redirect_uri"):
-            if not blob.get(key):
-                die(f"{path} に {key} がありません")
-        return blob, path
-    die("app.json がありません（リポジトリ同梱のものを使うか、"
-        f"{os.path.join(CONFIG_ROOT, 'app.json')} を作ってください）")
+        if blob.get("client_id") and blob.get("redirect_uri"):
+            return blob, path
+        blank.append(path)
+    if blank:
+        die(f"{blank[0]} の client_id / redirect_uri が空です。\n"
+            "    Slack アプリを作り、Basic Information の client_id と、\n"
+            "    OAuth & Permissions に登録した Redirect URL を記入してください")
+    die(f"app.json がありません（{os.path.join(CONFIG_ROOT, 'app.json')} を作るか、"
+        "リポジトリ同梱のものを記入してください）")
 
 
 def app_secret():
