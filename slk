@@ -264,10 +264,15 @@ def keychain_get(name):
 
 def keychain_set(name, token):
     """トークンを argv に置かない（ps から他プロセスに見える）。security は -w に値を
-    渡さないと stdin から入力と確認の 2 回読むので、同じ値を 2 行流す。"""
+    渡さないと入力と確認の 2 回読むので、同じ値を 2 行流す。
+
+    start_new_session は必須。security は制御端末があると stdin ではなく /dev/tty から
+    読むので、これを外すと対話シェルから実行したときだけ
+    「password data for new item:」で無言のまま止まる。"""
     r = subprocess.run(["security", "add-generic-password", "-s", KEYCHAIN_SERVICE,
                         "-a", name, "-U", "-w"],
-                       input=f"{token}\n{token}\n", capture_output=True, text=True)
+                       input=f"{token}\n{token}\n", capture_output=True, text=True,
+                       start_new_session=True)
     return r.returncode == 0, (r.stderr or "").strip()
 
 
