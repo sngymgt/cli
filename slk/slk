@@ -109,6 +109,10 @@ ID_RE = re.compile(r"^[CDGU][A-Z0-9]{6,}$")
 MENTION_RE = re.compile(r"<([@#!])([A-Za-z0-9^]+)(?:\|([^>]*))?>")
 ANGLE_RE = re.compile(r"<([^>|]+)(?:\|([^>]*))?>")
 ARCHIVE_RE = re.compile(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})")
+FILE_ID_RE = re.compile(r"\b(F[A-Z0-9]{6,})\b")
+# 認証情報を付けて叩いてよいファイル配信ホストと、転送を追ってよいスキーム（テストで差し替える）
+FILE_HOST_SUFFIX = ".slack.com"
+REDIRECT_SCHEMES = ("https",)
 
 G = {}
 
@@ -689,6 +693,109 @@ def msg_dict(prof, m, cid=None, channel=None, permalink=None):
 
 # --- コマンド ---------------------------------------------------------------
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def file_id(target):
+    """F… / permalink / url_private のどれからでもファイル ID を取り出す。
+
+    渡された URL をそのまま叩かないのは、認証情報を Slack 以外へ送らないため。
+    ID に落として files.info に問い直し、**API が返した URL だけ**を使う。"""
+    m = FILE_ID_RE.search(target or "")
+    if not m:
+        die(f"ファイル ID を取り出せません: {target}（F… か Slack のファイル URL を渡す）")
+    return m.group(1)
+
+
+def safe_name(name, fallback):
+    """ファイル名は Slack から来る値なので、そのまま開かない（../ で外に出られる）。"""
+    base = os.path.basename((name or "").strip()).lstrip(".")
+    base = re.sub(r"[/\\\x00]", "_", base)
+    return base or fallback
+
+
+def fetch_binary(url, token, hops=3):
+    """3xx は Authorization を外して追い直す。配信は署名付き URL に転送されることがあり、
+    ヘッダを付けたまま追うとトークンが Slack 以外（CDN）へ渡る。"""
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("User-Agent", USER_AGENT)
+    opener = urllib.request.build_opener(_NoRedirect)
+    for _ in range(hops):
+        try:
+            return opener.open(req, timeout=120)
+        except urllib.error.HTTPError as e:
+            # HTTPError は URLError の派生なので、必ずこちらを先に受ける
+            if not 300 <= e.code < 400:
+                die(f"ダウンロードに失敗しました: HTTP {e.code}")
+            loc = e.headers.get("Location")
+            if not loc:
+                die(f"HTTP {e.code} が返りましたが転送先がありません")
+            loc = urllib.parse.urljoin(req.full_url, loc)
+            if urllib.parse.urlsplit(loc).scheme not in REDIRECT_SCHEMES:
+                die(f"https 以外へは追いません: {loc}")
+            req = urllib.request.Request(loc)
+            req.add_header("User-Agent", USER_AGENT)
+        except urllib.error.URLError as e:
+            die(f"ダウンロードに接続できません: {e.reason}")
+    die("リダイレクトが多すぎます")
+
+
+def file_meta(prof, info):
+    return {"id": info.get("id"), "name": info.get("name"), "title": info.get("title"),
+            "filetype": info.get("filetype"), "mimetype": info.get("mimetype"),
+            "size": info.get("size"), "user": prof.user_name(info["user"]) if info.get("user") else None,
+            "time": fmt_ts(info.get("created")), "permalink": info.get("permalink"),
+            "channels": [prof.display_channel(c) for c in (info.get("channels") or [])]}
+
+
+def cmd_file(prof, args):
+    opts, rest = take_opts(args, {"-o": True, "--output": True, "--force": False, "--info": False})
+    if not rest:
+        die("usage: slk file <F… | permalink | URL> [-o <保存先>|-] [--force]\n"
+            "       slk file <…> --info    メタデータだけ見る（ダウンロードしない）")
+    prof.banner()
+    info = prof.call("files.info", {"file": file_id(rest[0])})["file"]
+
+    if opts.get("--info"):
+        if human():
+            for k, v in file_meta(prof, info).items():
+                print(f"{k:10} {v}")
+        else:
+            out_json(info if G.get("--raw") else file_meta(prof, info))
+        return
+
+    url = info.get("url_private_download") or info.get("url_private")
+    if not url:
+        die(f"実体をダウンロードできない項目です（mode={info.get('mode')}）")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or not parts.netloc.endswith(FILE_HOST_SUFFIX):
+        die(f"Slack 以外のホストには認証情報を送れません: {url}")
+
+    dest = opts.get("-o") or opts.get("--output")
+    if dest == "-":
+        res = fetch_binary(url, prof.token)
+        shutil.copyfileobj(res, sys.stdout.buffer)
+        return
+    name = safe_name(info.get("name"), f"{info.get('id')}.{info.get('filetype') or 'bin'}")
+    if dest is None:
+        dest = name
+    elif os.path.isdir(dest):
+        dest = os.path.join(dest, name)
+    if os.path.exists(dest) and not opts.get("--force"):
+        die(f"既にあります: {dest}（上書きするなら --force）")
+    res = fetch_binary(url, prof.token)
+    tmp = dest + ".part"
+    with open(tmp, "wb") as f:
+        shutil.copyfileobj(res, f)
+    os.replace(tmp, dest)
+    size = os.path.getsize(dest)
+    note(f"{info.get('name')} / {info.get('mimetype')} / {size} bytes")
+    print(dest)
+
+
 def cmd_search(prof, args):
     opts, rest = take_opts(args, {"--in": True, "--from": True, "--after": True, "--before": True,
                                   "--on": True, "--limit": True, "--all": False, "--sort": True,
@@ -737,7 +844,7 @@ def cmd_search(prof, args):
         out_json({"query": q, "total": total, "matches": matches})
         return
     if opts.get("--files"):
-        rows = [{"name": m.get("name"), "title": m.get("title"),
+        rows = [{"id": m.get("id"), "name": m.get("name"), "title": m.get("title"),
                  "user": m.get("username") or (prof.user_name(m["user"]) if m.get("user") else "?"),
                  "time": fmt_ts(m.get("timestamp")), "permalink": m.get("permalink")} for m in matches]
         if G.get("--json"):
@@ -1571,6 +1678,8 @@ USAGE = """usage: slk [--profile <name>] [--json|--raw] [--quiet] <command>
   slk history <#channel|@user> [--limit N] [--after ...] [--before ...] [--threads]
   slk thread <permalink | #channel ts>
   slk read <URL> [--context N]              URL のメッセージを前後・スレッドごと読む
+  slk file <F…|permalink|URL> [-o <先>|-] [--force] [--info]
+                                            添付ファイルを落とす（中身の解釈はしない）
   slk cache [refresh|clear]
   slk api <method> [k=v ...] [--all]        allowlist 内の読み取りメソッドだけ
 
@@ -1596,7 +1705,8 @@ def main():
     prof = Profile(active_name())
     table = {"search": cmd_search, "ask": cmd_ask, "channels": cmd_channels, "users": cmd_users,
              "members": cmd_members, "history": cmd_history, "thread": cmd_thread,
-             "read": cmd_read, "cache": cmd_cache, "whoami": cmd_whoami, "api": cmd_api}
+             "read": cmd_read, "cache": cmd_cache, "whoami": cmd_whoami, "api": cmd_api,
+             "file": cmd_file}
     if cmd not in table:
         die(f"未知のコマンド: {cmd}\n\n{USAGE}")
     table[cmd](prof, args)

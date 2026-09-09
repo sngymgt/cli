@@ -118,9 +118,14 @@ slk members <#channel>
 slk history <#channel|@user> [--limit N] [--after ...] [--before ...] [--threads]
 slk thread <permalink | #channel ts>
 slk read <URL> [--context N]
+slk file <F…|permalink|URL> [-o <先>|-] [--force] [--info]
 slk cache [refresh|clear]
 slk api <method> [k=v ...] [--all]
 ```
+
+`slk file` は添付を落とすだけで、**中身は解釈しない**（PDF や docx のテキスト抽出には依存
+パッケージが要り、単一ファイルで動く前提が壊れる）。落としたものを別のツールに渡すこと。
+`-o -` で標準出力に流せる。
 
 `slk ask` は Slack の Real-time Search API を使う。名前に反してキーワード一致なので、文章を
 丸ごと渡すと 0 件になる。単語で渡すこと。
