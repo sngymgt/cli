@@ -1231,6 +1231,12 @@ def install_token(name, token, auth, quiet=False):
     return blob
 
 
+def profile_identity(name):
+    """そのプロファイルのトークンが誰のものか。(team_id, user_id) が同じなら同じ人。"""
+    blob = _peek(os.path.join(PROFILE_ROOT, name, "team.json"))
+    return (blob.get("team_id"), blob.get("user_id"))
+
+
 def cmd_login(args):
     opts, rest = take_opts(args, {"--manual": False, "--timeout": True, "--reset-secret": False})
     app, app_path = load_app()
@@ -1297,20 +1303,33 @@ def cmd_login(args):
         }
         die(f"トークン交換に失敗しました: {err}" + (f"（{hints[err]}）" if err in hints else ""))
     auth = call(token, "auth.test")
+    # 上書きしてよいのは「同じワークスペースの同じ人」のプロファイルだけ。team_id だけで
+    # 一致を見ると、同じワークスペースの別アカウントで入ったときに他方を潰す
+    ident = (auth.get("team_id"), auth.get("user_id"))
     name = rest[0] if rest else None
-    if not name:
-        # 同じワークスペースのプロファイルが既にあるなら、別名で増やさずそれを更新する
-        for other in list_profiles():
-            blob = _peek(os.path.join(PROFILE_ROOT, other, "team.json"))
-            if blob.get("team_id") and blob["team_id"] == auth.get("team_id"):
-                name = other
-                break
+    if not name and all(ident):
+        matches = [p for p in list_profiles() if profile_identity(p) == ident]
+        if len(matches) > 1:
+            die("同じアカウントのプロファイルが複数あります: " + ", ".join(matches) +
+                "\n    どれを更新するか名前で指定してください: slk login <名前>")
+        if matches:
+            name = matches[0]
     if not name:
         m = re.match(r"https?://([^./]+)\.slack\.com", auth.get("url") or "")
-        name = m.group(1) if m else "default"
+        base = m.group(1) if m else "default"
+        name = base
+        if os.path.isdir(os.path.join(PROFILE_ROOT, name)) and profile_identity(name) != ident:
+            # 同名が別アカウントで使われている。奪わずに別名を作る
+            suffix = re.sub(r"[^A-Za-z0-9._-]", "-", auth.get("user") or "alt")
+            name = f"{base}-{suffix}"
+            if os.path.isdir(os.path.join(PROFILE_ROOT, name)) and profile_identity(name) != ident:
+                die(f"'{base}' も '{name}' も別のアカウントで使われています。"
+                    "名前を指定してください: slk login <名前>")
     if not NAME_RE.match(name):
         die(f"プロファイル名に使えない文字が含まれています: {name}")
     existing = os.path.isdir(os.path.join(PROFILE_ROOT, name))
+    if existing and all(ident) and profile_identity(name) not in (ident, (None, None)):
+        warn(f"プロファイル '{name}' は別のアカウントのものです。上書きします")
     blob = install_token(name, token, auth)
     print(f"プロファイル '{name}' を{'更新' if existing else '作成'}しました: "
           f"{blob['team']} / {blob['user']}")
