@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Zoho CRM API v8 CLI (OAuth 2.0 self client)."""
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.config/zoho")
+ENV_PATH = os.path.join(CONFIG_DIR, "env")
+TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")
+
+# 同一 API を秒間に叩きすぎると CONCURRENCY / rate limit で落ちるため間隔を空ける
+MIN_INTERVAL = 0.2
+_last_call = 0.0
+
+
+def die(msg):
+    print(f"zoho: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_env():
+    if not os.path.exists(ENV_PATH):
+        die(f"{ENV_PATH} がありません。`zoho init` を実行してください")
+    env = {}
+    with open(ENV_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    for key in ("ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET"):
+        if not env.get(key):
+            die(f"{ENV_PATH} に {key} がありません")
+    env.setdefault("ZOHO_DC", "jp")
+    dc = env["ZOHO_DC"]
+    env.setdefault("ZOHO_ACCOUNTS_BASE", f"https://accounts.zoho.{dc}")
+    env.setdefault("ZOHO_API_BASE", f"https://www.zohoapis.{dc}")
+    env.setdefault("ZOHO_API_VERSION", "v8")
+    return env
+
+
+def save_tokens(tokens):
+    tmp = TOKENS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(tokens, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, TOKENS_PATH)
+
+
+def load_tokens():
+    if not os.path.exists(TOKENS_PATH):
+        die("未認証です。`zoho auth <grant_token>` を実行してください")
+    with open(TOKENS_PATH) as f:
+        return json.load(f)
+
+
+def post_form(url, params):
+    body = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req) as res:
+            return json.loads(res.read().decode())
+    except urllib.error.HTTPError as e:
+        die(f"{url} -> {e.code} {e.read().decode()[:500]}")
+
+
+def token_endpoint(env):
+    return f"{env['ZOHO_ACCOUNTS_BASE']}/oauth/v2/token"
+
+
+def cmd_auth(env, args):
+    if not args:
+        die("usage: zoho auth <grant_token>")
+    res = post_form(token_endpoint(env), {
+        "grant_type": "authorization_code",
+        "client_id": env["ZOHO_CLIENT_ID"],
+        "client_secret": env["ZOHO_CLIENT_SECRET"],
+        "code": args[0],
+    })
+    if "refresh_token" not in res:
+        die(f"refresh_token が返りませんでした: {json.dumps(res, ensure_ascii=False)}")
+    save_tokens({
+        "access_token": res["access_token"],
+        "refresh_token": res["refresh_token"],
+        "expires_at": time.time() + int(res.get("expires_in", 3600)),
+        "api_domain": res.get("api_domain", env["ZOHO_API_BASE"]),
+    })
+    print(f"ok: {TOKENS_PATH} に保存しました (api_domain={res.get('api_domain')})")
+
+
+def access_token(env, force=False):
+    t = load_tokens()
+    if not force and t.get("access_token") and t.get("expires_at", 0) > time.time() + 60:
+        return t
+    res = post_form(token_endpoint(env), {
+        "grant_type": "refresh_token",
+        "client_id": env["ZOHO_CLIENT_ID"],
+        "client_secret": env["ZOHO_CLIENT_SECRET"],
+        "refresh_token": t["refresh_token"],
+    })
+    if "access_token" not in res:
+        die(f"リフレッシュ失敗: {json.dumps(res, ensure_ascii=False)}. `zoho auth` をやり直してください")
+    t["access_token"] = res["access_token"]
+    t["expires_at"] = time.time() + int(res.get("expires_in", 3600))
+    if res.get("api_domain"):
+        t["api_domain"] = res["api_domain"]
+    save_tokens(t)
+    return t
+
+
+def api_url(env, tokens, path):
+    if path.startswith("http"):
+        return path
+    base = tokens.get("api_domain") or env["ZOHO_API_BASE"]
+    path = path.lstrip("/")
+    if not path.startswith("crm/"):
+        path = f"crm/{env['ZOHO_API_VERSION']}/{path}"
+    return f"{base}/{path}"
+
+
+def call(env, method, path, params=None, body=None, _retried=False):
+    global _last_call
+    tokens = access_token(env)
+    url = api_url(env, tokens, path)
+    if params:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Zoho-oauthtoken {tokens['access_token']}")
+    if data:
+        req.add_header("Content-Type", "application/json")
+    wait = MIN_INTERVAL - (time.time() - _last_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call = time.time()
+    try:
+        with urllib.request.urlopen(req) as res:
+            raw = res.read().decode()
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        if e.code == 401 and not _retried:
+            access_token(env, force=True)
+            return call(env, method, path, params, body, _retried=True)
+        die(f"{method} {url} -> {e.code} {raw[:1000]}")
+
+
+def data_key(res):
+    if "data" in res and isinstance(res["data"], list):
+        return "data"
+    for k, v in res.items():
+        if k != "info" and isinstance(v, list):
+            return k
+    return None
+
+
+def cmd_get(env, args):
+    fetch_all = "--all" in args
+    args = [a for a in args if a != "--all"]
+    if not args:
+        die("usage: zoho get <path> [key=value ...] [--all]")
+    path, params = args[0], {}
+    for a in args[1:]:
+        if "=" not in a:
+            die(f"不正な引数: {a} (key=value 形式)")
+        k, v = a.split("=", 1)
+        params[k] = v
+    res = call(env, "GET", path, params)
+    if not fetch_all:
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return
+    key = data_key(res)
+    if key is None:
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return
+    rows = list(res[key])
+    info = res.get("info") or {}
+    while info.get("more_records"):
+        if info.get("next_page_token"):
+            params["page_token"] = info["next_page_token"]
+        else:
+            params["page"] = int(params.get("page", 1)) + 1
+        res = call(env, "GET", path, params)
+        rows.extend(res.get(key) or [])
+        info = res.get("info") or {}
+        print(f"  ... {len(rows)} 件", file=sys.stderr)
+    print(json.dumps({key: rows, "info": {"count": len(rows)}}, ensure_ascii=False, indent=2))
+
+
+def read_body(args):
+    """残り引数から JSON body を取る。@file / - (stdin) / インライン JSON。"""
+    if not args:
+        return json.load(sys.stdin)
+    src = args[0]
+    if src == "-":
+        return json.load(sys.stdin)
+    if src.startswith("@"):
+        with open(os.path.expanduser(src[1:])) as f:
+            return json.load(f)
+    return json.loads(src)
+
+
+def cmd_write(env, method, args):
+    if not args:
+        die(f"usage: zoho {method.lower()} <path> [@file | - | '<json>']")
+    res = call(env, method, args[0], body=read_body(args[1:]) if method != "DELETE" or args[1:] else None)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+
+
+def cmd_coql(env, args):
+    if not args:
+        die("usage: zoho coql \"select ... from Accounts where ...\"")
+    res = call(env, "POST", "coql", body={"select_query": args[0]})
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+
+
+def cmd_init(env_missing_ok=True):
+    if os.path.exists(ENV_PATH):
+        print(f"既に {ENV_PATH} があります")
+        return
+    with open(ENV_PATH, "w") as f:
+        f.write(
+            "# https://api-console.zoho.jp/ の Self Client で発行した値\n"
+            "ZOHO_CLIENT_ID=\n"
+            "ZOHO_CLIENT_SECRET=\n"
+            "ZOHO_DC=jp\n"
+        )
+    os.chmod(ENV_PATH, 0o600)
+    print(f"{ENV_PATH} を作成しました。CLIENT_ID / CLIENT_SECRET を記入してください")
+
+
+USAGE = """usage:
+  zoho init                              設定ファイルの雛形を作る
+  zoho auth <grant_token>                Self Client の grant token を交換して保存
+  zoho token                             アクセストークンを更新して状態を表示
+  zoho get <path> [k=v ...] [--all]      GET (--all で全ページ取得)
+  zoho post|put|patch|delete <path> [@file | - | '<json>']
+  zoho coql "<select_query>"             COQL クエリ
+
+path は crm/v8 が補われる (例: `zoho get Contracts fields=field11 per_page=200 --all`)。
+`settings/fields?module=Contracts` のように settings 配下もそのまま書ける。"""
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd, args = argv[0], argv[1:]
+    if cmd == "init":
+        cmd_init()
+        return
+    env = load_env()
+    if cmd == "auth":
+        cmd_auth(env, args)
+    elif cmd == "token":
+        t = access_token(env, force=True)
+        print(f"ok: 有効期限 {time.strftime('%H:%M:%S', time.localtime(t['expires_at']))} / api_domain={t.get('api_domain')}")
+    elif cmd == "get":
+        cmd_get(env, args)
+    elif cmd in ("post", "put", "patch", "delete"):
+        cmd_write(env, cmd.upper(), args)
+    elif cmd == "coql":
+        cmd_coql(env, args)
+    else:
+        die(f"未知のコマンド: {cmd}\n\n{USAGE}")
+
+
+if __name__ == "__main__":
+    main()

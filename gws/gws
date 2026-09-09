@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# gws wrapper: adds credential profiles on top of googleworkspace-cli.
+# A profile is just a gws config dir; GOOGLE_WORKSPACE_CLI_CONFIG_DIR selects it.
+set -euo pipefail
+
+PROFILE_ROOT="${GWS_PROFILE_ROOT:-$HOME/.config/gws-profiles}"
+ACTIVE_FILE="$PROFILE_ROOT/active"
+LEGACY_CONFIG="$HOME/.config/gws"
+
+self_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+real_gws=""
+IFS=':' read -r -a _path_parts <<< "$PATH"
+for _d in "${_path_parts[@]}"; do
+  [ -n "$_d" ] || continue
+  [ -x "$_d/gws" ] || continue
+  _cand="$(cd "$_d" && pwd -P)/gws"
+  [ "$_cand" = "$self_path" ] && continue
+  real_gws="$_d/gws"
+  break
+done
+if [ -z "$real_gws" ]; then
+  for _c in /opt/homebrew/bin/gws /usr/local/bin/gws; do
+    [ -x "$_c" ] && { real_gws="$_c"; break; }
+  done
+fi
+if [ -z "$real_gws" ]; then
+  echo "gws: googleworkspace-cli の実体が見つかりません (brew install googleworkspace-cli)" >&2
+  exit 127
+fi
+
+die() { echo "gws profile: $*" >&2; exit 1; }
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+
+require_name() {
+  [ -n "${1:-}" ] || die "プロファイル名を指定してください"
+  valid_name "$1" || die "プロファイル名に使えない文字が含まれています: $1"
+}
+
+ensure_root() {
+  mkdir -p "$PROFILE_ROOT"
+  [ -n "$(list_profiles)" ] && return 0
+  if [ -d "$LEGACY_CONFIG" ]; then
+    ln -s "$LEGACY_CONFIG" "$PROFILE_ROOT/default"
+  else
+    mkdir -p "$PROFILE_ROOT/default"
+    chmod 700 "$PROFILE_ROOT/default"
+  fi
+  printf 'default\n' > "$ACTIVE_FILE"
+}
+
+current_profile() {
+  if [ -n "${GWS_PROFILE:-}" ]; then printf '%s\n' "$GWS_PROFILE"; return; fi
+  if [ -s "$ACTIVE_FILE" ]; then head -n1 "$ACTIVE_FILE"; return; fi
+  local only; only="$(list_profiles)"
+  if [ "$(printf '%s\n' "$only" | grep -c .)" = "1" ]; then printf '%s\n' "$only"; return; fi
+  die "有効なプロファイルが未設定です（gws profile use <name>）"
+}
+
+profile_dir() {
+  valid_name "${1:-}" || return 1
+  printf '%s/%s\n' "$PROFILE_ROOT" "$1"
+}
+
+list_profiles() {
+  local d
+  for d in "$PROFILE_ROOT"/*; do
+    [ -d "$d" ] || continue
+    basename "$d"
+  done
+}
+
+authed() {
+  [ -f "$1/credentials.enc" ] || [ -f "$1/credentials.json" ]
+}
+
+# Resolves the signed-in address. Drive's about.get carries it under any drive
+# scope, which is the scope people actually grant; gmail is the fallback.
+resolve_label() {
+  local dir="$1" out email
+  out="$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$dir" "$real_gws" drive about get --params '{"fields":"user"}' 2>/dev/null || true)"
+  email="$(printf '%s' "$out" | sed -n 's/.*"emailAddress"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  if [ -z "$email" ]; then
+    out="$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$dir" "$real_gws" gmail users getProfile --params '{"userId":"me"}' 2>/dev/null || true)"
+    email="$(printf '%s' "$out" | sed -n 's/.*"emailAddress"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  fi
+  [ -n "$email" ] || return 1
+  printf '%s\n' "$email"
+}
+
+usage() {
+  cat <<'USAGE'
+gws profile — gws の認証情報プロファイルを切り替える
+
+  gws profile [list]              プロファイル一覧（* が有効）
+  gws profile current             有効なプロファイル名
+  gws profile use <name>          有効なプロファイルを切り替える
+  gws profile rename <old> <new>  プロファイルを改名する
+  gws profile add <name> [--client <client_secret.json>] [--no-login] [-- <auth login の引数>]
+                                  プロファイルを作って gws auth login を実行
+                                  --no-login なら箱だけ作る（auth setup を後で流すとき）
+  gws profile label <name> [text] 表示ラベルを設定（省略時は API で取得）
+  gws profile path [name]         設定ディレクトリのパス
+  gws profile rm <name> [-f]      プロファイルを削除
+
+  GWS_PROFILE=<name> gws ...      その1コマンドだけ別プロファイルで実行
+  GWS_PROFILE_ROOT=<dir>          プロファイル置き場（既定 ~/.config/gws-profiles）
+
+profile 以外の引数はすべて googleworkspace-cli にそのまま渡される。
+USAGE
+}
+
+cmd_profile() {
+  ensure_root
+  local sub="${1:-list}"
+  [ $# -gt 0 ] && shift || true
+
+  case "$sub" in
+    list|ls)
+      local active name dir label mark
+      active="$(current_profile)"
+      while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        dir="$(profile_dir "$name")" || continue
+        mark="  "; [ "$name" = "$active" ] && mark="* "
+        label=""
+        [ -s "$dir/.label" ] && label="$(head -n1 "$dir/.label")"
+        if ! authed "$dir"; then
+          label="${label:+$label }(未認証)"
+        fi
+        printf '%s%-12s %s\n' "$mark" "$name" "$label"
+      done < <(list_profiles)
+      ;;
+
+    current)
+      current_profile
+      ;;
+
+    use)
+      local name="${1:-}"
+      require_name "$name"
+      [ -d "$(profile_dir "$name")" ] || die "プロファイル '$name' がありません"
+      printf '%s\n' "$name" > "$ACTIVE_FILE"
+      echo "有効なプロファイル: $name"
+      [ -n "${GWS_PROFILE:-}" ] && echo "注意: 環境変数 GWS_PROFILE=$GWS_PROFILE が設定されているため、この設定より優先されます" >&2
+      ;;
+
+    add)
+      local name="" client="" no_login=0 login_args=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --client) client="${2:-}"; shift 2 ;;
+          --no-login) no_login=1; shift ;;
+          --) shift; login_args=("$@"); break ;;
+          -*) die "不明なオプション: $1" ;;
+          *) [ -z "$name" ] && name="$1" || die "引数が多すぎます: $1"; shift ;;
+        esac
+      done
+      require_name "$name"
+      local seed; seed="$(current_profile)"
+      local dir; dir="$(profile_dir "$name")"
+      [ -e "$dir" ] && die "プロファイル '$name' は既にあります"
+
+      mkdir -p "$dir"
+      chmod 700 "$dir"
+      if [ -n "$client" ]; then
+        [ -f "$client" ] || { rmdir "$dir"; die "OAuth クライアントが見つかりません: $client"; }
+        cp "$client" "$dir/client_secret.json"
+        echo "OAuth クライアントを取り込みました（コピー元は残っています）:"
+        echo "  元: $client"
+        echo "  先: $dir/client_secret.json"
+        echo "  取り込み済みなので元は削除して構いません: rm '$client'"
+      elif [ -f "$(profile_dir "$seed")/client_secret.json" ]; then
+        cp "$(profile_dir "$seed")/client_secret.json" "$dir/client_secret.json"
+        echo "OAuth クライアントは '$seed' から複製しました"
+      fi
+      chmod 600 "$dir/client_secret.json" 2>/dev/null || true
+      # Discovery docs are account-independent and ~7MB, so share one copy.
+      if [ -d "$(profile_dir "$seed")/cache" ] && [ ! -e "$dir/cache" ]; then
+        ln -s "$(profile_dir "$seed")/cache" "$dir/cache"
+      fi
+
+      if [ "$no_login" -eq 1 ]; then
+        echo "プロファイル '$name' を作成しました（未認証）"
+        echo "ログインするには: GWS_PROFILE=$name gws auth login"
+        exit 0
+      fi
+
+      echo "ブラウザで '$name' としてログインします..."
+      if GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$dir" "$real_gws" auth login ${login_args[@]+"${login_args[@]}"}; then
+        local email
+        if email="$(resolve_label "$dir")"; then
+          printf '%s\n' "$email" > "$dir/.label"
+          echo "プロファイル '$name' を作成しました ($email)"
+        else
+          echo "プロファイル '$name' を作成しました"
+        fi
+        echo "切り替えるには: gws profile use $name"
+      else
+        die "ログインに失敗しました。作りかけの設定は $dir に残っています"
+      fi
+      ;;
+
+    label)
+      local name="${1:-}"; shift || true
+      require_name "$name"
+      local dir; dir="$(profile_dir "$name")"
+      [ -d "$dir" ] || die "プロファイル '$name' がありません"
+      if [ $# -gt 0 ]; then
+        printf '%s\n' "$*" > "$dir/.label"
+      else
+        local email
+        email="$(resolve_label "$dir")" || die "API からアカウントを取得できませんでした（未認証か、drive/gmail のスコープが無い）"
+        printf '%s\n' "$email" > "$dir/.label"
+      fi
+      echo "$name: $(head -n1 "$dir/.label")"
+      ;;
+
+    rename|mv)
+      local old="${1:-}" new="${2:-}"
+      require_name "$old"
+      require_name "$new"
+      local old_dir new_dir
+      old_dir="$(profile_dir "$old")"
+      new_dir="$(profile_dir "$new")"
+      [ -e "$old_dir" ] || die "プロファイル '$old' がありません"
+      [ -e "$new_dir" ] && die "プロファイル '$new' は既にあります"
+      mv "$old_dir" "$new_dir"
+
+      # Profiles seeded from $old share its cache by symlink; those break on rename.
+      local other target
+      while IFS= read -r other; do
+        [ -n "$other" ] || continue
+        target="$(profile_dir "$other")/cache"
+        [ -L "$target" ] || continue
+        case "$(readlink "$target")" in
+          "$old_dir"/*|"$old_dir")
+            ln -sfn "$new_dir/cache" "$target"
+            echo "  '$other' の cache 参照を張り替えました"
+            ;;
+        esac
+      done < <(list_profiles)
+
+      if [ -s "$ACTIVE_FILE" ] && [ "$(head -n1 "$ACTIVE_FILE")" = "$old" ]; then
+        printf '%s\n' "$new" > "$ACTIVE_FILE"
+        echo "  有効なプロファイル名も '$new' に更新しました"
+      fi
+      echo "'$old' を '$new' に改名しました"
+      [ -L "$new_dir" ] && echo "（実体は $(readlink "$new_dir") のまま。移動していません）"
+      ;;
+
+    path)
+      local name="${1:-}"
+      [ -n "$name" ] || name="$(current_profile)"
+      require_name "$name"
+      profile_dir "$name"
+      ;;
+
+    rm|remove)
+      local name="" force=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -f|--yes) force=1; shift ;;
+          *) [ -z "$name" ] && name="$1" || die "引数が多すぎます: $1"; shift ;;
+        esac
+      done
+      require_name "$name"
+      [ "$name" = "$(current_profile)" ] && die "有効なプロファイルは削除できません（先に gws profile use で切り替える）"
+      local dir; dir="$(profile_dir "$name")"
+      [ -e "$dir" ] || die "プロファイル '$name' がありません"
+      if [ "$force" -ne 1 ]; then
+        printf "%s とその認証情報を削除します。よろしいですか? [y/N] " "$dir"
+        local ans=""; read -r ans || true
+        case "$ans" in y|Y|yes) ;; *) echo "中止しました"; exit 1 ;; esac
+      fi
+      # Profiles created by `add` share the seed's cache by symlink, so removing the
+      # seed would leave them dangling. Hand the real directory to a dependent first.
+      local deps=() other link
+      while IFS= read -r other; do
+        [ -n "$other" ] || continue
+        [ "$other" = "$name" ] && continue
+        link="$(profile_dir "$other")/cache"
+        [ -L "$link" ] || continue
+        case "$(readlink "$link")" in
+          "$dir"|"$dir"/*) deps+=("$other") ;;
+        esac
+      done < <(list_profiles)
+
+      if [ "${#deps[@]}" -gt 0 ]; then
+        local dir_phys cache_phys destroyed=0
+        dir_phys="$(cd "$dir" 2>/dev/null && pwd -P)" || dir_phys=""
+        cache_phys="$(cd "$dir/cache" 2>/dev/null && pwd -P)" || cache_phys=""
+        if [ -n "$cache_phys" ] && [ ! -L "$dir" ] && [ -n "$dir_phys" ]; then
+          case "$cache_phys" in "$dir_phys"/*) destroyed=1 ;; esac
+        fi
+
+        if [ -z "$cache_phys" ]; then
+          for other in ${deps[@]+"${deps[@]}"}; do
+            rm -f "$(profile_dir "$other")/cache"
+            echo "  '$other' の壊れた cache 参照を外しました"
+          done
+        elif [ "$destroyed" -eq 1 ]; then
+          local heir="${deps[0]}"
+          rm -f "$(profile_dir "$heir")/cache"
+          mv "$cache_phys" "$(profile_dir "$heir")/cache"
+          echo "  共有 cache の実体を '$heir' に引き継ぎました"
+          for other in ${deps[@]+"${deps[@]}"}; do
+            [ "$other" = "$heir" ] && continue
+            ln -sfn "$(profile_dir "$heir")/cache" "$(profile_dir "$other")/cache"
+            echo "  '$other' の cache 参照を '$heir' に張り替えました"
+          done
+        else
+          for other in ${deps[@]+"${deps[@]}"}; do
+            ln -sfn "$cache_phys" "$(profile_dir "$other")/cache"
+            echo "  '$other' の cache 参照を $cache_phys に張り替えました"
+          done
+        fi
+      fi
+
+      if [ -L "$dir" ]; then
+        echo "注意: '$name' は $(readlink "$dir") への symlink です。実体は消さずに参照だけ外します"
+      fi
+      rm -rf "$dir"
+      echo "プロファイル '$name' を削除しました"
+      ;;
+
+    help|-h|--help)
+      usage
+      ;;
+
+    *)
+      die "不明なサブコマンド: $sub（gws profile help）"
+      ;;
+  esac
+}
+
+if [ "${1:-}" = "profile" ] && [ -z "${GWS_PROFILE_PASSTHROUGH:-}" ]; then
+  shift
+  cmd_profile "$@"
+  exit 0
+fi
+
+ensure_root
+profile="$(current_profile)"
+if ! valid_name "$profile"; then
+  echo "gws: プロファイル名に使えない文字が含まれています: $profile" >&2
+  exit 1
+fi
+config_dir="$(profile_dir "$profile")"
+if [ ! -d "$config_dir" ]; then
+  echo "gws: プロファイル '$profile' がありません（gws profile list）" >&2
+  exit 1
+fi
+export GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir"
+exec "$real_gws" "$@"

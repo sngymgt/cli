@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""tl;dv API (v1alpha1) CLI. 認証は API キー 1 本のみ。
+
+ドキュメントに書かれていない API の癖（実測。知らないと必ず一度踏む）:
+
+- 一覧のページサイズは `limit`（最大 100）。レスポンスが `pageSize` という名前で返すので
+  紛らわしいが、`pageSize` を渡しても**エラーにならず無視される**。未知のパラメータは
+  すべて黙って捨てられるので、効いていないことに気づけない。
+- transcript / notes が 403 になるかは、**そのミーティングの主催者の席のプラン**で決まる。
+  キーの持ち主のプランでもワークスペース所属でもない。tl;dv の画面で見えていても
+  主催者が Free なら API では取れず、主催者を Pro 以上に上げると**過去の分まで遡って開く**。
+- 403 と紛らわしいものとして、成功しつつ空の {} を返すミーティングがある（録音が短い等）。
+  再試行しても変わらないので、403 と同じ「取れないもの」に混ぜて数えないこと。
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.config/tldv")
+ENV_PATH = os.path.join(CONFIG_DIR, "env")
+
+API_BASE = "https://pasta.tldv.io"
+API_VERSION = "v1alpha1"
+
+USER_AGENT = "tldv-cli/1.0"
+
+# レート制限が公開されていないため、こちらから間隔を空けて叩く
+MIN_INTERVAL = 0.25
+_last_call = 0.0
+
+
+def die(msg):
+    print(f"tldv: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_env():
+    if not os.path.exists(ENV_PATH):
+        die(f"{ENV_PATH} がありません。`tldv init` を実行してください")
+    env = {}
+    with open(ENV_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    if not env.get("TLDV_API_KEY"):
+        die(f"{ENV_PATH} に TLDV_API_KEY がありません")
+    env.setdefault("TLDV_API_BASE", API_BASE)
+    return env
+
+
+def origin(url):
+    p = urllib.parse.urlsplit(url)
+    return (p.scheme, p.netloc)
+
+
+def api_url(env, path):
+    """API キーを付けて叩く URL。設定した tl;dv のオリジン以外は組み立てない。"""
+    if "://" in path:
+        if origin(path) != origin(env["TLDV_API_BASE"]):
+            die(f"tl;dv 以外のホストには送れません: {path}")
+        return path
+    path = path.lstrip("/")
+    if not path.startswith(f"{API_VERSION}/"):
+        path = f"{API_VERSION}/{path}"
+    return f"{env['TLDV_API_BASE'].rstrip('/')}/{path}"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def call(env, method, path, params=None, body=None, _hops=0):
+    global _last_call
+    url = api_url(env, path)
+    if params:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("x-api-key", env["TLDV_API_KEY"])
+    req.add_header("Accept", "application/json")
+    # 既定の Python-urllib/x.y は Cloudflare 側で UA ごと 403 (error 1010) にされる
+    req.add_header("User-Agent", USER_AGENT)
+    if data:
+        req.add_header("Content-Type", "application/json")
+    wait = MIN_INTERVAL - (time.time() - _last_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call = time.time()
+    # urllib はリダイレクト先にも独自ヘッダを引き継ぐので、x-api-key を他ホストに
+    # 渡さないよう自前で判定する（録画の download は別ホストの署名付き URL に飛ぶ）
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req) as res:
+            raw = res.read().decode()
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            loc = urllib.parse.urljoin(url, e.headers.get("Location") or "")
+            if origin(loc) == origin(env["TLDV_API_BASE"]) and _hops < 3:
+                return call(env, method, loc, None, body, _hops + 1)
+            return {"url": loc}
+        die(f"{method} {url} -> {e.code} {e.read().decode()[:1000]}")
+
+
+def parse_params(args):
+    params = {}
+    for a in args:
+        if "=" not in a:
+            die(f"不正な引数: {a} (key=value 形式)")
+        k, v = a.split("=", 1)
+        params[k] = v
+    return params
+
+
+MAX_LIMIT = 100
+
+
+def get_all(env, path, params):
+    """page/pages 形式のページングを最後まで追って results を連結する。"""
+    params = dict(params)
+    params.setdefault("page", "1")
+    params.setdefault("limit", str(MAX_LIMIT))
+    res = call(env, "GET", path, params)
+    if not isinstance(res.get("results"), list):
+        return res
+    rows = list(res["results"])
+    pages = int(res.get("pages") or 1)
+    page = int(res.get("page") or 1)
+    while page < pages:
+        page += 1
+        params["page"] = str(page)
+        res = call(env, "GET", path, params)
+        rows.extend(res.get("results") or [])
+        print(f"  ... {len(rows)} 件 (page {page}/{pages})", file=sys.stderr)
+    return {"total": len(rows), "results": rows}
+
+
+def out(obj):
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def cmd_get(env, args):
+    fetch_all = "--all" in args
+    args = [a for a in args if a != "--all"]
+    if not args:
+        die("usage: tldv get <path> [k=v ...] [--all]")
+    path, params = args[0], parse_params(args[1:])
+    out(get_all(env, path, params) if fetch_all else call(env, "GET", path, params))
+
+
+def cmd_meetings(env, args):
+    cmd_get(env, ["meetings"] + args)
+
+
+def cmd_sub(env, name, args):
+    if not args:
+        die(f"usage: tldv {name} <meetingId>")
+    out(call(env, "GET", f"meetings/{args[0]}/{name}"))
+
+
+def cmd_meeting(env, args):
+    if not args:
+        die("usage: tldv meeting <meetingId>")
+    out(call(env, "GET", f"meetings/{args[0]}"))
+
+
+def cmd_download(env, args):
+    """録画本体は落とさず、302 先の署名付き URL だけ返す（URL は期限切れになる）。"""
+    if not args:
+        die("usage: tldv download <meetingId>")
+    res = call(env, "GET", f"meetings/{args[0]}/download")
+    print(res.get("url") or json.dumps(res, ensure_ascii=False))
+
+
+def cmd_init():
+    if os.path.exists(ENV_PATH):
+        print(f"既に {ENV_PATH} があります")
+        return
+    with open(ENV_PATH, "w") as f:
+        f.write(
+            "# https://tldv.io/app/settings/personal-settings/api-keys で発行した値\n"
+            "TLDV_API_KEY=\n"
+        )
+    os.chmod(ENV_PATH, 0o600)
+    print(f"{ENV_PATH} を作成しました。TLDV_API_KEY を記入してください")
+
+
+USAGE = """usage:
+  tldv init                              設定ファイルの雛形を作る
+  tldv health                            疎通確認
+  tldv meetings [k=v ...] [--all]        ミーティング一覧 (--all で全ページ)
+  tldv meeting <id>                      ミーティング単体
+  tldv transcript <id>                   文字起こし
+  tldv notes <id>                        AI ノート
+  tldv download <id>                     録画の署名付き URL を表示
+  tldv get <path> [k=v ...] [--all]      任意の GET
+
+path は v1alpha1 が補われる (例: `tldv get meetings page=2 limit=100`)。
+API は alpha 版。
+
+meetings が受け付けるパラメータ (これ以外は黙って無視される):
+  page, limit (最大 100), from, to (ISO 日付), meetingType (internal|external), query
+
+transcript / notes の 403 は主催者の席のプランで決まる (詳細はこのファイル冒頭)。"""
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd, args = argv[0], argv[1:]
+    if cmd == "init":
+        cmd_init()
+        return
+    env = load_env()
+    if cmd == "health":
+        out(call(env, "GET", "health"))
+    elif cmd == "meetings":
+        cmd_meetings(env, args)
+    elif cmd == "meeting":
+        cmd_meeting(env, args)
+    elif cmd in ("transcript", "notes", "highlights"):
+        cmd_sub(env, cmd, args)
+    elif cmd == "download":
+        cmd_download(env, args)
+    elif cmd == "get":
+        cmd_get(env, args)
+    else:
+        die(f"未知のコマンド: {cmd}\n\n{USAGE}")
+
+
+if __name__ == "__main__":
+    main()

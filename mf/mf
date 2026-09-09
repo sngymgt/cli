@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""マネーフォワード クラウド API CLI (OAuth 2.0 authorization code + PKCE)。
+
+請求書と会計は認可サーバを共有し、API ホスト・スコープ・一覧レスポンスの封筒だけが違う。
+"""
+
+import base64
+import hashlib
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+AUTHORIZE_URL = "https://api.biz.moneyforward.com/authorize"
+TOKEN_URL = "https://api.biz.moneyforward.com/token"
+
+SERVICES = {
+    "invoice": {
+        "base": "https://invoice.moneyforward.com/api/v3",
+        "scopes": ["mfc/invoice/data.read"],
+        "paths": "office, partners, items, billings, quotes, sent_histories",
+    },
+    "accounting": {
+        "base": "https://api-accounting.moneyforward.com/api/v3",
+        "scopes": [
+            "mfc/accounting/offices.read",
+            "mfc/accounting/accounts.read",
+            "mfc/accounting/departments.read",
+            "mfc/accounting/journal.read",
+            "mfc/accounting/report.read",
+            "mfc/accounting/taxes.read",
+            "mfc/accounting/trade_partners.read",
+            "mfc/accounting/transaction.read",
+            "mfc/accounting/connected_account.read",
+        ],
+        "paths": (
+            "offices, term_settings, accounts, sub_accounts, departments, taxes, "
+            "trade_partners, journals, transactions, connected_accounts, "
+            "reports/trial_balance_bs, reports/trial_balance_pl, "
+            "reports/transition_bs, reports/transition_pl"
+        ),
+    },
+}
+ALIASES = {"inv": "invoice", "acc": "accounting", "ca": "accounting"}
+
+CONFIG_DIR = os.path.expanduser(os.environ.get("MF_CONFIG_DIR", "~/.config/mf"))
+ENV_PATH = os.path.join(CONFIG_DIR, "env")
+TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")
+
+# 各エンドポイント 1 秒 3 回が上限（超過で 429）。請求書・会計とも同じで、
+# アクセストークン単位の計測なので両サービスを跨いでこの間隔を守る必要がある。
+MIN_INTERVAL = 0.34
+_last_call = 0.0
+
+
+def die(msg):
+    print(f"mf: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def default_scope():
+    return " ".join(s for svc in SERVICES.values() for s in svc["scopes"])
+
+
+def load_env():
+    if not os.path.exists(ENV_PATH):
+        die(f"{ENV_PATH} がありません。MF_CLIENT_ID / MF_CLIENT_SECRET を書いてください")
+    env = {}
+    with open(ENV_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    for key in ("MF_CLIENT_ID", "MF_CLIENT_SECRET"):
+        if not env.get(key):
+            die(f"{ENV_PATH} に {key} がありません")
+    env.setdefault("MF_REDIRECT_URI", "http://localhost:12345/callback")
+    env.setdefault("MF_SCOPE", default_scope())
+    return env
+
+
+def save_tokens(tokens):
+    tmp = TOKENS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(tokens, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, TOKENS_PATH)
+
+
+def load_tokens():
+    if not os.path.exists(TOKENS_PATH):
+        die("未ログインです。`mf login` を実行してください")
+    with open(TOKENS_PATH) as f:
+        return json.load(f)
+
+
+def token_request(env, params):
+    basic = base64.b64encode(
+        f"{env['MF_CLIENT_ID']}:{env['MF_CLIENT_SECRET']}".encode()
+    ).decode()
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=urllib.parse.urlencode(params).encode(),
+        headers={
+            "Authorization": f"Basic {basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            body = json.load(res)
+    except urllib.error.HTTPError as e:
+        die(f"token エンドポイントが {e.code}: {e.read().decode(errors='replace')}")
+    body["obtained_at"] = time.time()
+    # MF は更新のたびに refresh_token を回転させるので、必ず書き戻す
+    save_tokens(body)
+    return body
+
+
+def access_token(env, force_refresh=False):
+    tokens = load_tokens()
+    expires_at = tokens.get("obtained_at", 0) + tokens.get("expires_in", 0) - 60
+    if force_refresh or time.time() >= expires_at:
+        if not tokens.get("refresh_token"):
+            die("refresh_token がありません。`mf login` をやり直してください")
+        tokens = token_request(
+            env,
+            {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]},
+        )
+    return tokens["access_token"]
+
+
+def require_scopes(service):
+    """付与済みスコープに足りないものがあれば、叩く前に落として再ログインを促す。"""
+    if not os.path.exists(TOKENS_PATH):
+        return
+    with open(TOKENS_PATH) as f:
+        granted = set((json.load(f).get("scope") or "").split())
+    if not granted:
+        return
+    missing = [s for s in SERVICES[service]["scopes"] if s not in granted]
+    if missing:
+        die(
+            f"今のトークンに {service} のスコープがありません: {' '.join(missing)}\n"
+            f"    `mf login` で認可し直してください"
+        )
+
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    result = None
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        _CallbackHandler.result = dict(urllib.parse.parse_qsl(parsed.query))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(
+            "<h1>認可を受け取りました</h1><p>ターミナルに戻ってください。</p>".encode()
+        )
+
+    def log_message(self, *args):
+        pass
+
+
+def cmd_login(env, argv):
+    scope = env["MF_SCOPE"]
+    if argv and argv[0] == "--scope":
+        if len(argv) < 2:
+            die("--scope の値がありません")
+        scope = argv[1]
+    elif argv:
+        service = ALIASES.get(argv[0], argv[0])
+        if service not in SERVICES:
+            die(f"不明なサービス: {argv[0]}")
+        scope = " ".join(SERVICES[service]["scopes"])
+
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).decode().rstrip("=")
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .decode()
+        .rstrip("=")
+    )
+    state = secrets.token_urlsafe(24)
+    params = {
+        "response_type": "code",
+        "client_id": env["MF_CLIENT_ID"],
+        "redirect_uri": env["MF_REDIRECT_URI"],
+        "scope": scope,
+        "state": state,
+    }
+    if os.environ.get("MF_NO_PKCE") != "1":
+        params["code_challenge"] = challenge
+        params["code_challenge_method"] = "S256"
+    url = f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
+
+    parsed = urllib.parse.urlparse(env["MF_REDIRECT_URI"])
+    server = HTTPServer((parsed.hostname, parsed.port or 80), _CallbackHandler)
+    print(f"要求するスコープ:\n  " + "\n  ".join(scope.split()) + "\n")
+    print("以下の URL をブラウザで開いて承認してください:\n")
+    print(url + "\n")
+    webbrowser.open(url)
+    print(f"{env['MF_REDIRECT_URI']} で待機中... (中断は Ctrl-C)")
+    server.handle_request()
+    server.server_close()
+
+    result = _CallbackHandler.result or {}
+    if result.get("error"):
+        die(f"認可が拒否されました: {result.get('error')} {result.get('error_description', '')}")
+    if result.get("state") != state:
+        die("state が一致しません。中断しました")
+    if not result.get("code"):
+        die("認可コードを受け取れませんでした")
+
+    body = {
+        "grant_type": "authorization_code",
+        "code": result["code"],
+        "redirect_uri": env["MF_REDIRECT_URI"],
+    }
+    if os.environ.get("MF_NO_PKCE") != "1":
+        body["code_verifier"] = verifier
+    tokens = token_request(env, body)
+    print(f"ログインしました。トークンを {TOKENS_PATH} に保存しました")
+    granted = (tokens.get("scope") or "").split()
+    denied = [s for s in scope.split() if s not in granted]
+    if denied:
+        print("要求したが付与されなかったスコープ:\n  " + "\n  ".join(denied))
+
+
+def api_call(env, service, method, path, query=None, data=None, retried=False):
+    global _last_call
+    wait = MIN_INTERVAL - (time.time() - _last_call)
+    if wait > 0:
+        time.sleep(wait)
+
+    url = f"{SERVICES[service]['base']}/{path.lstrip('/')}"
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    headers = {
+        "Authorization": f"Bearer {access_token(env)}",
+        "Accept": "application/json",
+    }
+    payload = None
+    if data is not None:
+        payload = json.dumps(data).encode()
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    _last_call = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as res:
+            raw = res.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and not retried:
+            access_token(env, force_refresh=True)
+            return api_call(env, service, method, path, query, data, retried=True)
+        if e.code == 429 and not retried:
+            time.sleep(2)
+            return api_call(env, service, method, path, query, data, retried=True)
+        die(f"{method} {url} が {e.code}: {e.read().decode(errors='replace')}")
+
+
+def envelope(body):
+    """一覧レスポンスから (配列のキー, 要素, 総ページ数) を取り出す。
+
+    請求書は `data` + `pagination`、会計はエンドポイント名のキー（`journals` 等）+ `metadata`
+    と封筒が違うので、キー名を決め打ちにできない。
+    """
+    meta = body.get("pagination") or body.get("metadata") or {}
+    if isinstance(body.get("data"), list):
+        key = "data"
+    else:
+        key = next((k for k, v in body.items() if isinstance(v, list)), None)
+    if key is None:
+        die(f"ページングできるレスポンスではありません: キー {list(body)}")
+    return key, body[key], meta.get("total_pages")
+
+
+def parse_query(argv):
+    query, data, fetch_all = {}, None, False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--all":
+            fetch_all = True
+        elif arg == "--data":
+            i += 1
+            raw = argv[i]
+            if raw.startswith("@"):
+                with open(os.path.expanduser(raw[1:])) as f:
+                    raw = f.read()
+            data = json.loads(raw)
+        elif "=" in arg:
+            k, v = arg.split("=", 1)
+            query[k] = v
+        else:
+            die(f"解釈できない引数: {arg}")
+        i += 1
+    return query, data, fetch_all
+
+
+def cmd_http(env, service, method, argv):
+    if not argv:
+        die(f"使い方: mf {service} {method.lower()} <path> [key=value ...] [--data JSON] [--all]")
+    path, rest = argv[0], argv[1:]
+    query, data, fetch_all = parse_query(rest)
+    require_scopes(service)
+
+    if fetch_all:
+        items, key, page = [], "data", 1
+        while True:
+            query["page"] = page
+            query.setdefault("per_page", 100)
+            key, chunk, total_pages = envelope(api_call(env, service, method, path, query, data))
+            items.extend(chunk)
+            if page >= (total_pages or page):
+                break
+            page += 1
+        print(json.dumps({key: items, "count": len(items)}, ensure_ascii=False, indent=2))
+        return
+
+    body = api_call(env, service, method, path, query, data)
+    print(json.dumps(body, ensure_ascii=False, indent=2) if body is not None else "")
+
+
+USAGE = """使い方:
+  mf login [invoice|accounting|--scope '<scopes>']
+                                   ブラウザで認可してトークンを保存（既定は全サービスの参照系）
+  mf token                         有効なアクセストークンを表示（必要なら自動更新）
+  mf <service> get <path> [k=v ...] [--all]
+  mf <service> post|put|delete <path> [--data '<json>'|@file]
+
+service: invoice (inv) / accounting (acc, ca)
+path は各サービスの /api/v3 以下。
+
+  invoice     office, partners, items, billings, quotes, sent_histories
+  accounting  offices, term_settings, accounts, sub_accounts, departments, taxes,
+              trade_partners, journals, transactions, connected_accounts,
+              reports/trial_balance_bs, reports/trial_balance_pl,
+              reports/transition_bs, reports/transition_pl
+
+例:
+  mf invoice get billings from=2026-08-01 to=2026-08-31 range_key=billing_date --all
+  mf accounting get offices
+  mf accounting get reports/transition_pl type=monthly fiscal_year=2026
+  mf accounting get journals from=2026-04-01 to=2026-08-31 --all
+"""
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    env = load_env()
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "login":
+        cmd_login(env, rest)
+        return
+    if cmd == "token":
+        print(access_token(env))
+        return
+
+    service = ALIASES.get(cmd, cmd)
+    if service not in SERVICES:
+        die(f"不明なコマンド: {cmd}\n\n{USAGE}")
+    if not rest:
+        die(f"使い方: mf {service} get|post|put|delete <path> ...")
+    method, rest = rest[0], rest[1:]
+    if method not in ("get", "post", "put", "delete"):
+        die(f"不明なメソッド: {method}")
+    cmd_http(env, service, method.upper(), rest)
+
+
+if __name__ == "__main__":
+    main()
