@@ -34,6 +34,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.error
@@ -784,13 +785,39 @@ def cmd_file(prof, args):
         dest = name
     elif os.path.isdir(dest):
         dest = os.path.join(dest, name)
-    if os.path.exists(dest) and not opts.get("--force"):
-        die(f"既にあります: {dest}（上書きするなら --force）")
-    res = fetch_binary(url, prof.token)
-    tmp = dest + ".part"
-    with open(tmp, "wb") as f:
-        shutil.copyfileobj(res, f)
-    os.replace(tmp, dest)
+    out_dir = os.path.dirname(os.path.abspath(dest))
+    if not os.path.isdir(out_dir):
+        die(f"保存先のディレクトリがありません: {out_dir}")
+
+    if opts.get("--force"):
+        # 既存を消すのはダウンロードが終わってから。途中で失敗して元を失わないようにする
+        fd, tmp = tempfile.mkstemp(prefix=".slk-", dir=out_dir)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                shutil.copyfileobj(fetch_binary(url, prof.token), f)
+            os.replace(tmp, dest)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    else:
+        # 存在確認と書き込みを分けると、その隙に作られたファイルを潰す。O_EXCL で
+        # 名前の確保そのものを不可分にする
+        try:
+            out = open(dest, "xb")
+        except FileExistsError:
+            die(f"既にあります: {dest}（上書きするなら --force）")
+        try:
+            with out as f:
+                shutil.copyfileobj(fetch_binary(url, prof.token), f)
+                # 別のプロセスが同じ名前に書いていた場合に、その残りが末尾に付いたままに
+                # ならないよう、書いた長さで切る
+                f.truncate()
+        except BaseException:
+            # ここで消してよいのは、この呼び出しが作ったファイルだと確定しているため
+            if os.path.exists(dest):
+                os.unlink(dest)
+            raise
     size = os.path.getsize(dest)
     note(f"{info.get('name')} / {info.get('mimetype')} / {size} bytes")
     print(dest)
