@@ -58,6 +58,9 @@ slk login
 ブラウザで承認すると、その人自身のトークンが Keychain に入る。**トークンは人ごとに別**で、互いに
 失効させない。読める範囲は各自の Slack の権限どおりになる。
 
+同じワークスペースのプロファイルが既にあれば、それを更新する（名前は増えない）。別名で作りたい
+ときは `slk login <名前>` と明示する。名前を変えたくなったら `slk profile rename <old> <new>`。
+
 自動でターミナルに戻れない場合は着地ページにコードが出るので、それを貼れば同じ結果になる
 （`slk login --manual` で最初から貼り付け方式）。
 
@@ -101,7 +104,7 @@ slk login
 ```
 slk manifest [--search both|legacy|rts]
 slk login [<profile 名>] [--manual] [--reset-secret]
-slk profile [list|current|use|add|keychain [--force]|label|path|rm]
+slk profile [list|current|use|add|keychain [--force]|rename|label|path|rm]
 slk whoami
 
 slk search "<query>" [--in #ch] [--from @user] [--after ...] [--before ...]

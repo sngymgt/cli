@@ -59,6 +59,14 @@ MIN_INTERVAL = 0.34
 _last_call = 0.0
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """リダイレクトを追わない。urllib は転送先が別ホストでも Authorization を持ち回るため、
+    追うと Basic / Bearer が MF 以外へ渡りうる。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def die(msg):
     print(f"mf: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -116,9 +124,12 @@ def token_request(env, params):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as res:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=30) as res:
             body = json.load(res)
     except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            die(f"token エンドポイントが {e.code}。リダイレクトは追いません"
+                f"（転送先: {e.headers.get('Location')}）")
         die(f"token エンドポイントが {e.code}: {e.read().decode(errors='replace')}")
     body["obtained_at"] = time.time()
     # MF は更新のたびに refresh_token を回転させるので、必ず書き戻す
@@ -257,10 +268,13 @@ def api_call(env, service, method, path, query=None, data=None, retried=False):
     req = urllib.request.Request(url, data=payload, headers=headers, method=method)
     _last_call = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=60) as res:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=60) as res:
             raw = res.read()
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            die(f"{method} {url} -> {e.code} リダイレクトは追いません"
+                f"（転送先: {e.headers.get('Location')}）")
         if e.code == 401 and not retried:
             access_token(env, force_refresh=True)
             return api_call(env, service, method, path, query, data, retried=True)

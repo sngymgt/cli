@@ -1299,6 +1299,13 @@ def cmd_login(args):
     auth = call(token, "auth.test")
     name = rest[0] if rest else None
     if not name:
+        # 同じワークスペースのプロファイルが既にあるなら、別名で増やさずそれを更新する
+        for other in list_profiles():
+            blob = _peek(os.path.join(PROFILE_ROOT, other, "team.json"))
+            if blob.get("team_id") and blob["team_id"] == auth.get("team_id"):
+                name = other
+                break
+    if not name:
         m = re.match(r"https?://([^./]+)\.slack\.com", auth.get("url") or "")
         name = m.group(1) if m else "default"
     if not NAME_RE.match(name):
@@ -1460,6 +1467,41 @@ def cmd_profile(args):
         note("気になる場合は Slack 側でトークンを再発行してください。")
         return
 
+    if sub in ("rename", "mv"):
+        if len(rest) < 2:
+            die("usage: slk profile rename <old> <new>")
+        old, new = rest[0], rest[1]
+        old_dir, new_dir = profile_dir(old), profile_dir(new)
+        if not os.path.isdir(old_dir):
+            die(f"プロファイル '{old}' がありません")
+        if os.path.exists(new_dir):
+            die(f"プロファイル '{new}' は既にあります")
+        # Keychain の account はプロファイル名そのものなので、先に複製して読み戻せることを
+        # 確かめてから元を消す。途中で失敗したら何も壊さずに戻す
+        token = keychain_get(old) if keychain_ok() else None
+        if token:
+            ok, err = keychain_set(new, token)
+            if not ok:
+                die(f"Keychain に '{new}' を作れませんでした: {err}")
+            if keychain_get(new) != token:
+                keychain_del(new)
+                die("Keychain に書いた値を読み戻せませんでした。何も変更していません")
+        try:
+            os.rename(old_dir, new_dir)
+        except OSError as e:
+            if token:
+                keychain_del(new)
+            die(f"ディレクトリを移動できませんでした: {e}")
+        if token:
+            keychain_del(old)
+            write_env_stub(new_dir)
+        if os.path.exists(ACTIVE_FILE) and open(ACTIVE_FILE).readline().strip() == old:
+            with open(ACTIVE_FILE, "w") as f:
+                f.write(new + "\n")
+            print(f"有効なプロファイル名も '{new}' に更新しました")
+        print(f"'{old}' を '{new}' に改名しました")
+        return
+
     if sub == "path":
         print(profile_dir(rest[0] if rest else active_name()))
         return
@@ -1490,7 +1532,7 @@ def cmd_profile(args):
         return
 
     die(f"不明なサブコマンド: {sub}"
-        "（slk profile list|current|use|add|keychain|label|path|rm）")
+        "（slk profile list|current|use|add|keychain|rename|label|path|rm）")
 
 
 USAGE = """usage: slk [--profile <name>] [--json|--raw] [--quiet] <command>
@@ -1498,7 +1540,7 @@ USAGE = """usage: slk [--profile <name>] [--json|--raw] [--quiet] <command>
   slk manifest [--search both|legacy|rts]   アプリ作成用の manifest を出す
   slk login [<profile 名>] [--manual] [--reset-secret]
                                             ブラウザで承認して自分のトークンを取る
-  slk profile [list|current|use|add|keychain [--force]|label|path|rm]
+  slk profile [list|current|use|add|keychain [--force]|rename|label|path|rm]
   slk whoami                                トークンの持ち主とワークスペース
 
   slk search "<query>" [--in #ch] [--from @user] [--after 2026-09-01] [--before ...]

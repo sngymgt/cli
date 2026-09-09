@@ -17,4 +17,5 @@
 ## 注意
 
 - 請求書 API は API キーに対応しておらず、OAuth のみ
+- リダイレクトは追わない。urllib は転送先が別ホストでも Authorization を持ち回るため
 - `mf-invoice` という旧コマンド名を使っていた場合は、`mf invoice …` に読み替える
