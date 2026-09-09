@@ -115,8 +115,29 @@ def access_token(env, force=False):
     return t
 
 
+def origin(url):
+    p = urllib.parse.urlsplit(url)
+    return (p.scheme, p.netloc)
+
+
+def allowed_origins(env, tokens):
+    """トークンを付けて叩いてよいホスト。api_domain は認可時に Zoho が返した値。"""
+    return {origin(u) for u in (tokens.get("api_domain"), env["ZOHO_API_BASE"]) if u}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """リダイレクトを追わない。urllib は転送先が別ホストでも Authorization を持ち回るため、
+    許可したオリジンを一度確認しても、その先で外部に渡ってしまう。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def api_url(env, tokens, path):
-    if path.startswith("http"):
+    """アクセストークンを付けて叩く URL。設定した Zoho のオリジン以外は組み立てない。"""
+    if "://" in path:
+        if origin(path) not in allowed_origins(env, tokens):
+            die(f"Zoho 以外のホストには送れません: {path}")
         return path
     base = tokens.get("api_domain") or env["ZOHO_API_BASE"]
     path = path.lstrip("/")
@@ -140,12 +161,16 @@ def call(env, method, path, params=None, body=None, _retried=False):
     if wait > 0:
         time.sleep(wait)
     _last_call = time.time()
+    opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with urllib.request.urlopen(req) as res:
+        with opener.open(req) as res:
             raw = res.read().decode()
             return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as e:
         raw = e.read().decode()
+        if 300 <= e.code < 400:
+            die(f"{method} {url} -> {e.code} リダイレクトは追いません"
+                f"（転送先: {e.headers.get('Location')}）")
         if e.code == 401 and not _retried:
             access_token(env, force=True)
             return call(env, method, path, params, body, _retried=True)
