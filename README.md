@@ -9,6 +9,7 @@ POSIX シェルのみ）で、設定は `~/.config/<名前>/` に置く。
 | [`zoho`](zoho/) | Zoho CRM API v8（`get` / `coql` / 書き込み） | OAuth Self Client |
 | [`mf`](mf/) | マネーフォワード クラウド（請求書・会計） | OAuth + PKCE |
 | [`tldv`](tldv/) | tl;dv（ミーティング・文字起こし・AI ノート） | API キー |
+| [`zp`](zp/) | Zoom Phone（通話履歴・録音・録音の文字起こし） | Server-to-Server OAuth |
 | [`gws`](gws/) | `googleworkspace-cli` に認証プロファイル切替を足すラッパー | 本体に委譲 |
 
 ## インストール
@@ -17,7 +18,7 @@ POSIX シェルのみ）で、設定は `~/.config/<名前>/` に置く。
 git clone git@github.com:sngymgt/cli.git
 cd cli
 git config core.hooksPath .githooks
-for t in slk zoho mf tldv gws; do ln -s "$PWD/$t/$t" ~/.local/bin/$t; done
+for t in slk zoho mf tldv gws zp; do ln -s "$PWD/$t/$t" ~/.local/bin/$t; done
 ```
 
 必要なものだけ symlink すればよい。`~/.local/bin` に PATH が通っていること。更新は `git pull` だけ。

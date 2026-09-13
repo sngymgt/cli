@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""Zoom Phone API CLI. 認証は Server-to-Server OAuth (grant_type=account_credentials)。
+
+ドキュメントに書かれていない / 書かれ方が実態と合わない癖
+(実測と Zoom 公式フォーラムの回答。知らないと必ず一度踏む):
+
+- **録音一覧の経路はアカウントによって違う。** 公開ドキュメントの記載が薄く、Zoom 自身が
+  フォーラムで「一部の録音系エンドポイントは beta なので private」と回答している。
+  アカウント単位 (`phone/recordings`) で取れるか、ユーザー単位
+  (`phone/users/<id>/recordings`) でしか取れないかはプランと付与された scope で変わる。
+  決め打ちで書かず `zp probe` で当たりを取ってから使うこと。
+- **録音と文字起こしの download は本文を返さず、署名付きの配信先へ 302 で飛ばす。**
+  追わないと本文に到達できないが、`Authorization` を持ったまま追うと配信先 (CDN) に
+  トークンが渡る。1 ホップずつ自分で追い、**転送先には資格情報を付け直さない**
+  (署名は URL 側にあるので付ける必要が無い)。
+- **文字起こしは録音の処理時に作られるので、設定を有効にする前の通話には遡及しない。**
+  「1 件も文字起こしが無い」を設定漏れと区別できない。有効化したらテスト架電で確かめること。
+- **文字起こしの言語はユーザー設定の「デフォルトの文字起こし言語」で決まり、既定は英語。**
+  日本語の通話を英語として起こしてもエラーにならず、読めない結果だけが返る。
+- **文字起こしが無い録音は 404 ではなく `code 12000 "Unable to transcribe this recording"`。**
+  未対応・処理中・設定漏れのどれなのかは応答から区別できない。
+- **付与された scope はトークンのレスポンスにしか出ない。** 申請した scope と実際に付いた
+  scope はズレる (アプリを Activate し直していない等)。`zp health` で実際の値を見ること。
+- **API のホストはアカウントのデータ所在地で変わる** (`api-us.zoom.us` など)。
+  トークンのレスポンスの `api_url` が権威で、`api.zoom.us` も通ることが多いが同じとは限らない。
+  返ってきた値を使う。ただし任意のホストに資格情報を送らないよう `*.zoom.us` に限る。
+- **録音の `download_url` に入っている ID は、その録音の `id` とは別物。**
+  `id` から download の URL を組み立てても取れないので、一覧が返した `download_url` を
+  そのまま渡すこと。単体の録音を引くエンドポイントは無い (GET は 405)。
+- 一覧の `from` / `to` は日付 (YYYY-MM-DD) で、遡れる範囲と 1 回の幅に上限がある。
+  超えるとエラーになるので、長期間は日付を割って回す。
+"""
+
+import base64
+import http.client
+import json
+import os
+import shutil
+import stat
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.config/zp")
+ENV_PATH = os.path.join(CONFIG_DIR, "env")
+
+# アカウントのデータ所在地が分かる前に使う既定。実際のホストはトークンが返す (zoom_host)
+API_BASE = "https://api.zoom.us/v2"
+TOKEN_URL = "https://zoom.us/oauth/token"
+REDIRECT_SCHEMES = {"https"}
+MAX_REDIRECTS = 5
+
+USER_AGENT = "zp-cli/1.0"
+
+# 拡張子は Content-Type から決める。録音は mp3 だが m4a が返ることがある
+EXT_BY_TYPE = {"audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/mp4": "m4a",
+               "audio/x-m4a": "m4a", "audio/wav": "wav", "audio/x-wav": "wav"}
+
+
+def die(msg):
+    print(f"zp: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def note(msg):
+    print(f"# {msg}", file=sys.stderr)
+
+
+def secure(path, mode):
+    """権限を必ず mode まで絞る。`os.makedirs(mode=...)` は**既にあるディレクトリには
+    効かず**、作成時の mode も umask で削られる。そのため「作るときに指定した」だけでは
+    client_secret が他人に読める状態が残りうるので、毎回現在値を見て直す。"""
+    current = stat.S_IMODE(os.stat(path).st_mode)
+    if current != mode:
+        os.chmod(path, mode)
+        note(f"{path} の権限を {current:04o} から {mode:04o} に直しました")
+
+
+def load_env():
+    if not os.path.exists(ENV_PATH):
+        die(f"{ENV_PATH} がありません。`zp init` を実行してください")
+    # ファイルだけ閉じても、ディレクトリが書ける状態なら env ごと差し替えられる。
+    # 緩められるのは init のあとなので、init ではなく実行のたびに両方見る
+    secure(CONFIG_DIR, 0o700)
+    secure(ENV_PATH, 0o600)
+    env = {}
+    with open(ENV_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    for key in ("ZOOM_ACCOUNT_ID", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET"):
+        if not env.get(key):
+            die(f"{ENV_PATH} に {key} がありません")
+    return env
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib の自動追従を止める。転送先が別ホストでも Authorization を持ち回るため、
+    入口のオリジンを確認しても配信先にトークンが渡る。追従は fetch() が自前でやる。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# S2S のトークンは 1 時間で、1 回の実行の中でしか使わない。ディスクに置くと
+# 秘密の置き場所が増えるだけなので、プロセス内にしか持たない
+_token = None
+# トークンと一緒に返る、このアカウントの API ホスト。api.zoom.us とは限らない
+_api_base = None
+
+
+def zoom_host(url):
+    """資格情報を送ってよいのは zoom.us 配下だけ。トークンのレスポンスが返した値でも、
+    ホストを確かめずに使うと、応答を差し替えられたときに送り先ごと乗っ取られる。"""
+    scheme, netloc = urllib.parse.urlsplit(url)[:2]
+    host = netloc.split("@")[-1].split(":")[0].lower()
+    return scheme == "https" and (host == "zoom.us" or host.endswith(".zoom.us"))
+
+
+def access_token(env, verbose=False):
+    global _token, _api_base
+    if _token:
+        return _token
+    body = urllib.parse.urlencode({
+        "grant_type": "account_credentials",
+        "account_id": env["ZOOM_ACCOUNT_ID"],
+    }).encode()
+    basic = base64.b64encode(
+        f"{env['ZOOM_CLIENT_ID']}:{env['ZOOM_CLIENT_SECRET']}".encode()).decode()
+    req = urllib.request.Request(TOKEN_URL, data=body, method="POST")
+    req.add_header("Authorization", f"Basic {basic}")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("User-Agent", USER_AGENT)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            payload = json.loads(res.read().decode())
+    except urllib.error.HTTPError as e:
+        die(f"トークン取得に失敗しました: HTTP {e.code} {e.read().decode()[:500]}")
+    except urllib.error.URLError as e:
+        die(f"Zoom に接続できません: {e.reason}")
+    if "access_token" not in payload:
+        die(f"access_token が返りませんでした: {json.dumps(payload, ensure_ascii=False)}")
+    _token = payload["access_token"]
+    returned = (payload.get("api_url") or "").rstrip("/")
+    if returned and not zoom_host(returned):
+        die(f"トークンが zoom.us 以外の api_url を返しました: {returned}")
+    _api_base = f"{returned}/v2" if returned else API_BASE
+    if verbose:
+        print("付与された scope:")
+        for s in sorted((payload.get("scope") or "").split()):
+            print(f"  {s}")
+        print(f"有効期限: {payload.get('expires_in')} 秒 / API: {_api_base}")
+    return _token
+
+
+def api_url(path):
+    """アクセストークンを付けて叩く URL。zoom.us 配下以外は組み立てない。"""
+    # 空白や制御文字が混じったまま送ると urllib が InvalidURL を投げて
+    # トレースバックで落ちる。引数の打ち間違いなので、ここで読める形で止める
+    bad = next((c for c in path if c.isspace() or ord(c) < 0x20), None)
+    if bad is not None:
+        die(f"パスに使えない文字があります（{bad!r}）: {path!r}")
+    if "://" in path:
+        if not zoom_host(path):
+            die(f"Zoom 以外のホストには送れません: {path}")
+        return path
+    return f"{_api_base or API_BASE}/{path.lstrip('/')}"
+
+
+def fetch(env, path, params=None, timeout=180):
+    """本文をストリームで返す (呼び出し側が close する)。3xx は資格情報を外して追い直す。
+
+    録音と文字起こしの download は署名付きの配信先へ転送されるので、追わないと本文が
+    取れない。転送先に Authorization を付け直さないのは、署名が URL 側にあって不要な一方、
+    付けると Zoom 以外にトークンが渡るため。
+    """
+    # 叩く先のホストはトークンと一緒に返るので、URL を組み立てる前に取る
+    token = access_token(env)
+    url = api_url(path)
+    if params:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
+    opener = urllib.request.build_opener(_NoRedirect)
+    for _ in range(MAX_REDIRECTS + 1):
+        req = urllib.request.Request(url, method="GET")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        try:
+            return opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            # HTTPError は URLError の派生なので、必ずこちらを先に受ける
+            if not 300 <= e.code < 400:
+                raise
+            loc = e.headers.get("Location")
+            if not loc:
+                die(f"HTTP {e.code} が返りましたが転送先がありません: {url}")
+            url = urllib.parse.urljoin(url, loc)
+            if urllib.parse.urlsplit(url).scheme not in REDIRECT_SCHEMES:
+                die(f"https 以外へは追いません: {url}")
+            note(f"redirect -> {urllib.parse.urlsplit(url).netloc} (資格情報は付け直さない)")
+            headers = {"User-Agent": USER_AGENT}
+        except urllib.error.URLError as e:
+            die(f"Zoom に接続できません: {e.reason}")
+        except http.client.HTTPException as e:
+            die(f"リクエストを組み立てられません: {type(e).__name__}: {e}")
+    die(f"リダイレクトが {MAX_REDIRECTS} 回を超えました")
+
+
+def call(env, path, params=None, raw=False):
+    """(status, body) を返す。エラーでも例外にせず返すのは、probe が分岐に使うため。"""
+    try:
+        with fetch(env, path, params) as res:
+            data = res.read()
+            return res.status, (data if raw else as_json(data))
+    except urllib.error.HTTPError as e:
+        data = e.read()
+        return e.code, (data if raw else as_json(data))
+
+
+def as_json(data):
+    text = data.decode(errors="replace")
+    try:
+        return json.loads(text) if text.strip() else {}
+    except ValueError:
+        return text
+
+
+def out(obj):
+    if isinstance(obj, (str, bytes)):
+        sys.stdout.write(obj.decode(errors="replace") if isinstance(obj, bytes) else obj)
+        print()
+        return
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def check(status, body, path):
+    if status != 200:
+        code = body.get("code") if isinstance(body, dict) else None
+        msg = body.get("message") if isinstance(body, dict) else str(body)[:300]
+        die(f"{path} -> HTTP {status}" + (f" code={code}" if code else "") + f" {msg}")
+    return body
+
+
+def list_key(body):
+    """一覧の中身が入っているキー。Zoom はエンドポイントごとに名前が違う。"""
+    for k, v in body.items():
+        if isinstance(v, list) and k not in ("errors",):
+            return k
+    return None
+
+
+def paged(env, path, params, fetch_all):
+    """--all のときだけ next_page_token を追う。戻り値は最後の応答に全件を詰めたもの。"""
+    params = dict(params or {})
+    params.setdefault("page_size", 100 if fetch_all else 30)
+    status, body = call(env, path, params)
+    check(status, body, path)
+    if not fetch_all or not isinstance(body, dict):
+        return body
+    key = list_key(body)
+    if key is None:
+        return body
+    items = list(body[key])
+    token = body.get("next_page_token")
+    while token:
+        params["next_page_token"] = token
+        status, page = call(env, path, params)
+        check(status, page, path)
+        items += page.get(key, [])
+        token = page.get("next_page_token")
+    body[key] = items
+    body["next_page_token"] = ""
+    return body
+
+
+def take_opts(args, spec):
+    """spec は {"--flag": 値を取るか}。未知の - 始まりは通す (k=v と紛れないため)。"""
+    opts, rest, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a in spec:
+            if spec[a]:
+                i += 1
+                if i >= len(args):
+                    die(f"{a} に値がありません")
+                opts[a] = args[i]
+            else:
+                opts[a] = True
+        else:
+            rest.append(a)
+        i += 1
+    return opts, rest
+
+
+def kv(args):
+    params = {}
+    for a in args:
+        if "=" not in a:
+            die(f"不正な引数: {a} (key=value 形式)")
+        k, v = a.split("=", 1)
+        params[k] = v
+    return params
+
+
+def default_range():
+    import datetime
+    today = datetime.date.today()
+    return (today - datetime.timedelta(days=7)).isoformat(), today.isoformat()
+
+
+def with_range(params):
+    """from / to は省略されがちだが、無いと既定の幅が何かを Zoom が明言していない。
+    こちらで直近 7 日を入れて、いつの分を見ているかを曖昧にしない。"""
+    frm, to = default_range()
+    params.setdefault("from", frm)
+    params.setdefault("to", to)
+    return params
+
+
+def cmd_health(env, args):
+    access_token(env, verbose=True)
+    print()
+    for path in ("phone/users", "phone/account_settings"):
+        status, body = call(env, path, {"page_size": 1} if path.endswith("users") else None)
+        detail = ""
+        if status != 200 and isinstance(body, dict):
+            detail = f"  {body.get('code')} {body.get('message')}"
+        print(f"{'ok' if status == 200 else 'NG'} [{status}] {path}{detail}")
+
+
+def cmd_probe(env, args):
+    """使える経路を総当たりで確かめる。ファイル冒頭のとおり、録音系はアカウントによって
+    通るエンドポイントが違うので、実装の前にここで当たりを取る。"""
+    frm, to = default_range()
+    if len(args) >= 1:
+        frm = args[0]
+    if len(args) >= 2:
+        to = args[1]
+    access_token(env, verbose=True)
+    print(f"\n期間: {frm} 〜 {to}\n")
+
+    rng = {"from": frm, "to": to, "page_size": 30}
+    for label, path, params in [
+        ("phone ユーザー一覧", "phone/users", {"page_size": 30}),
+        ("アカウント録音一覧", "phone/recordings", rng),
+        ("通話履歴 (新)", "phone/call_history", rng),
+        ("通話ログ (旧・廃止済みのはず)", "phone/call_logs", rng),
+        ("アカウント設定", "phone/account_settings", None),
+    ]:
+        status, body = call(env, path, params)
+        detail = ""
+        if status == 200 and isinstance(body, dict):
+            key = list_key(body)
+            if key:
+                detail = f"{key}: {len(body[key])} 件 / total_records={body.get('total_records')}"
+        elif isinstance(body, dict):
+            detail = f"{body.get('code')} {body.get('message')}"
+        print(f"[{status}] {label:28s} {path:24s} {detail}")
+
+    status, body = call(env, "phone/recordings", rng)
+    recs = body.get("recordings", []) if isinstance(body, dict) else []
+    if not recs:
+        print("\nアカウント単位で録音が取れないので、ユーザー単位を試します")
+        status, body = call(env, "phone/users", {"page_size": 100})
+        for u in (body.get("users", []) if isinstance(body, dict) else []):
+            st, b = call(env, f"phone/users/{u['id']}/recordings",
+                         {"from": frm, "to": to, "page_size": 30})
+            n = len(b.get("recordings", [])) if isinstance(b, dict) and st == 200 else 0
+            print(f"  [{st}] {u.get('email')} -> {n} 件")
+            if n:
+                recs = b["recordings"]
+                break
+    if not recs:
+        print("\nこの期間の録音が 1 件も取れません。scope・プラン・期間を確認してください")
+        return
+
+    print("\n--- 録音レコードの形 (1 件目) ---")
+    out(recs[0])
+
+    # 長い通話ほど文字起こしが載っている見込みが高いので、長い順に試す
+    for rec in sorted(recs, key=lambda r: r.get("duration") or 0, reverse=True)[:3]:
+        print(f"\n--- transcript: id={rec.get('id')} duration={rec.get('duration')} ---")
+        status, body = call(env, f"phone/recording_transcript/download/{rec.get('id')}", raw=True)
+        text = body.decode(errors="replace") if isinstance(body, bytes) else str(body)
+        print(f"[{status}] {text[:2000]}")
+
+
+def cmd_users(env, args):
+    opts, rest = take_opts(args, {"--all": False})
+    out(paged(env, "phone/users", kv(rest), opts.get("--all", False)))
+
+
+def cmd_recordings(env, args):
+    opts, rest = take_opts(args, {"--all": False})
+    out(paged(env, "phone/recordings", with_range(kv(rest)), opts.get("--all", False)))
+
+
+def cmd_history(env, args):
+    opts, rest = take_opts(args, {"--all": False})
+    out(paged(env, "phone/call_history", with_range(kv(rest)), opts.get("--all", False)))
+
+
+def cmd_transcript(env, args):
+    if not args:
+        die("usage: zp transcript <recordingId>")
+    path = f"phone/recording_transcript/download/{args[0]}"
+    status, body = call(env, path, raw=True)
+    if status != 200:
+        body = as_json(body) if isinstance(body, bytes) else body
+        code = body.get("code") if isinstance(body, dict) else None
+        if code == 12000:
+            die("この録音には文字起こしがありません (code 12000)。"
+                "未対応・処理中・設定漏れのどれなのかは応答から区別できません。"
+                "文字起こしの有効化と、ユーザー設定の文字起こし言語を確認してください")
+        check(status, body, path)
+    out(body)
+
+
+def cmd_download(env, args):
+    opts, rest = take_opts(args, {"-o": True, "--output": True, "--force": False})
+    if not rest:
+        die("usage: zp download <download_url|recordingId> [-o <保存先>|-] [--force]")
+    # 一覧が返す download_url の ID は録音の id と別物なので、id からは組み立てられない。
+    # URL を渡された場合はそのまま使う (ホストは api_url が確かめる)
+    target = rest[0]
+    path = target if "://" in target else f"phone/recording/download/{target}"
+    rid = target.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+    dest = opts.get("-o") or opts.get("--output")
+
+    if dest == "-":
+        with fetch(env, path) as res:
+            shutil.copyfileobj(res, sys.stdout.buffer)
+        return
+
+    # 拡張子は Content-Type で決まるので、先に 1 バイトも読まずにヘッダだけ見る
+    res = fetch(env, path)
+    with res:
+        ctype = (res.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        name = f"{rid}.{EXT_BY_TYPE.get(ctype, 'mp3')}"
+        if dest is None:
+            dest = name
+        elif os.path.isdir(dest):
+            dest = os.path.join(dest, name)
+        out_dir = os.path.dirname(os.path.abspath(dest))
+        if not os.path.isdir(out_dir):
+            die(f"保存先のディレクトリがありません: {out_dir}")
+
+        if opts.get("--force"):
+            # 既存を消すのはダウンロードが終わってから。途中で失敗して元を失わないようにする
+            fd, tmp = tempfile.mkstemp(prefix=".zp-", dir=out_dir)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    shutil.copyfileobj(res, f)
+                os.replace(tmp, dest)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                raise
+        else:
+            # 存在確認と書き込みを分けると、その隙に作られたファイルを潰す。
+            # O_EXCL で名前の確保そのものを不可分にする
+            try:
+                fh = open(dest, "xb")
+            except FileExistsError:
+                die(f"既にあります: {dest} (上書きするなら --force)")
+            try:
+                with fh as f:
+                    shutil.copyfileobj(res, f)
+                    f.truncate()
+            except BaseException:
+                if os.path.exists(dest):
+                    os.unlink(dest)
+                raise
+    note(f"{ctype or '(Content-Type なし)'} / {os.path.getsize(dest)} bytes")
+    print(dest)
+
+
+def cmd_get(env, args):
+    opts, rest = take_opts(args, {"--all": False})
+    if not rest:
+        die("usage: zp get <path> [k=v ...] [--all]")
+    out(paged(env, rest[0], kv(rest[1:]), opts.get("--all", False)))
+
+
+def cmd_init():
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    secure(CONFIG_DIR, 0o700)
+    if os.path.exists(ENV_PATH):
+        secure(ENV_PATH, 0o600)
+        print(f"既に {ENV_PATH} があります")
+        return
+    # O_EXCL と 0600 で作る。open() してから chmod すると、その間は umask の権限で見える
+    fd = os.open(ENV_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(
+            "# https://marketplace.zoom.us/ の Build App > Server-to-Server OAuth で発行した値\n"
+            "ZOOM_ACCOUNT_ID=\n"
+            "ZOOM_CLIENT_ID=\n"
+            "ZOOM_CLIENT_SECRET=\n"
+        )
+    print(f"{ENV_PATH} を作成しました。ACCOUNT_ID / CLIENT_ID / CLIENT_SECRET を記入してください")
+
+
+USAGE = """usage:
+  zp init                                設定ファイルの雛形を作る
+  zp health                              付与された scope と疎通を表示
+  zp probe [FROM] [TO]                   使える経路を総当たりで確認する (既定は直近 7 日)
+  zp users [k=v ...] [--all]             Zoom Phone ユーザー一覧
+  zp recordings [k=v ...] [--all]        録音一覧 (from/to 省略時は直近 7 日)
+  zp history [k=v ...] [--all]           通話履歴 (phone/call_history)
+  zp transcript <recordingId>            文字起こしを返ってきたまま表示
+  zp download <download_url|id> [-o <先>|-] [--force]   録音の音声を保存
+                                         （一覧が返す download_url をそのまま渡す）
+  zp get <path> [k=v ...] [--all]        任意の GET
+
+path は v2 が補われる (例: `zp get phone/users/<userId>/recordings from=2026-09-01`)。
+from / to は YYYY-MM-DD。
+
+録音系はアカウントによって通るエンドポイントが違う。実装の前に `zp probe` で当たりを取る。
+文字起こしの言語はユーザー設定の「デフォルトの文字起こし言語」で決まり、既定は英語
+(詳細はこのファイル冒頭の docstring)。"""
+
+
+COMMANDS = {
+    "health": cmd_health,
+    "probe": cmd_probe,
+    "users": cmd_users,
+    "recordings": cmd_recordings,
+    "history": cmd_history,
+    "transcript": cmd_transcript,
+    "download": cmd_download,
+    "get": cmd_get,
+}
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd, args = argv[0], argv[1:]
+    if cmd == "init":
+        cmd_init()
+        return
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        die(f"未知のコマンド: {cmd}\n\n{USAGE}")
+    try:
+        fn(load_env(), args)
+    except BrokenPipeError:
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    main()
