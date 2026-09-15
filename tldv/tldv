@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+import stat
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,14 +35,36 @@ MIN_INTERVAL = 0.25
 _last_call = 0.0
 
 
+# 取り切れずに返したときの理由。取れた分は出したうえで exit 1 にする
+_incomplete = None
+
+
 def die(msg):
     print(f"tldv: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
+def incomplete(msg):
+    global _incomplete
+    _incomplete = msg
+    print(f"# {msg}", file=sys.stderr)
+
+
+def secure(path, mode):
+    """権限を必ず mode まで絞る。makedirs(mode=) は既存ディレクトリには効かず、
+    作成時の mode も umask で削られるので、実行のたびに現在値を見て直す。"""
+    current = stat.S_IMODE(os.stat(path).st_mode)
+    if current != mode:
+        os.chmod(path, mode)
+        print(f"# {path} の権限を {current:04o} から {mode:04o} に直しました", file=sys.stderr)
+
+
 def load_env():
     if not os.path.exists(ENV_PATH):
         die(f"{ENV_PATH} がありません。`tldv init` を実行してください")
+    # ファイルだけ閉じても、ディレクトリが書ける状態なら env ごと差し替えられる
+    secure(CONFIG_DIR, 0o700)
+    secure(ENV_PATH, 0o600)
     env = {}
     with open(ENV_PATH) as f:
         for line in f:
@@ -52,7 +75,11 @@ def load_env():
             env[k.strip()] = v.strip().strip('"').strip("'")
     if not env.get("TLDV_API_KEY"):
         die(f"{ENV_PATH} に TLDV_API_KEY がありません")
-    env.setdefault("TLDV_API_BASE", API_BASE)
+    base = env.setdefault("TLDV_API_BASE", API_BASE)
+    # 送り先を env が自由に決められると、env を書ける相手に API キーを渡せてしまう
+    # （http への降格も含む）。既定と同じオリジンだけ許す
+    if origin(base) != origin(API_BASE):
+        die(f"TLDV_API_BASE は {API_BASE} と同じオリジンにしてください: {base}")
     return env
 
 
@@ -99,16 +126,27 @@ def call(env, method, path, params=None, body=None, _hops=0):
     # 渡さないよう自前で判定する（録画の download は別ホストの署名付き URL に飛ぶ）
     opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with opener.open(req) as res:
-            raw = res.read().decode()
-            return json.loads(raw) if raw.strip() else {}
+        with opener.open(req, timeout=120) as res:
+            raw = res.read().decode(errors="replace")
+            if not raw.strip():
+                return {}
+            try:
+                return json.loads(raw)
+            except ValueError:
+                # Cloudflare のチャレンジやキャプティブポータルは 200 で HTML を返す
+                die(f"{method} {url} -> JSON が返りませんでした: {raw[:300]}")
     except urllib.error.HTTPError as e:
         if e.code in (301, 302, 303, 307, 308):
             loc = urllib.parse.urljoin(url, e.headers.get("Location") or "")
             if origin(loc) == origin(env["TLDV_API_BASE"]) and _hops < 3:
+                # urljoin で query が落ちるので、転送先が持っていなければ引き継ぐ
+                if params and not urllib.parse.urlsplit(loc).query:
+                    return call(env, method, loc, params, body, _hops + 1)
                 return call(env, method, loc, None, body, _hops + 1)
-            return {"url": loc}
-        die(f"{method} {url} -> {e.code} {e.read().decode()[:1000]}")
+            die(f"{method} {url} -> {e.code} 転送先を追えません: {loc}")
+        die(f"{method} {url} -> {e.code} {e.read().decode(errors='replace')[:1000]}")
+    except urllib.error.URLError as e:
+        die(f"tldv に接続できません: {e.reason}")
 
 
 def parse_params(args):
@@ -133,15 +171,35 @@ def get_all(env, path, params):
     if not isinstance(res.get("results"), list):
         return res
     rows = list(res["results"])
-    pages = int(res.get("pages") or 1)
+    total = res.get("total")
+    try:
+        pages = int(res.get("pages") or 1)
+    except (TypeError, ValueError):
+        incomplete(f"pages が数値ではありません: {res.get('pages')!r}")
+        return {"total": len(rows), "results": rows}
     page = int(res.get("page") or 1)
     while page < pages:
         page += 1
         params["page"] = str(page)
         res = call(env, "GET", path, params)
-        rows.extend(res.get("results") or [])
+        # 冒頭 docstring のとおり、未知・不正なパラメータはエラー無しで捨てられる。
+        # page が効いていない場合、同じページを足し続けて重複だけが増える
+        got = res.get("results")
+        if not isinstance(got, list) or not got:
+            incomplete(f"page {page}/{pages} が空です。{len(rows)} 件で打ち切りました")
+            break
+        if res.get("page") is not None and int(res["page"]) != page:
+            incomplete(f"page={page} を要求したのに {res['page']} が返りました。"
+                       f"サーバが page を無視しています")
+            break
+        rows.extend(got)
         print(f"  ... {len(rows)} 件 (page {page}/{pages})", file=sys.stderr)
-    return {"total": len(rows), "results": rows}
+    if isinstance(total, int) and len(rows) < total:
+        incomplete(f"{total} 件中 {len(rows)} 件しか取れませんでした")
+    # total は自分で数え直さない。打ち切った件数を総数として書くと、
+    # 途中までの出力が完全な取得と見分けられなくなる
+    return {"total": total if isinstance(total, int) else len(rows),
+            "fetched": len(rows), "results": rows}
 
 
 def out(obj):
@@ -182,15 +240,19 @@ def cmd_download(env, args):
 
 
 def cmd_init():
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    secure(CONFIG_DIR, 0o700)
     if os.path.exists(ENV_PATH):
+        secure(ENV_PATH, 0o600)
         print(f"既に {ENV_PATH} があります")
         return
-    with open(ENV_PATH, "w") as f:
+    # O_EXCL と 0600 で作る。open() してから chmod すると、その間は umask の権限で見える
+    fd = os.open(ENV_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(
             "# https://tldv.io/app/settings/personal-settings/api-keys で発行した値\n"
             "TLDV_API_KEY=\n"
         )
-    os.chmod(ENV_PATH, 0o600)
     print(f"{ENV_PATH} を作成しました。TLDV_API_KEY を記入してください")
 
 
@@ -201,11 +263,12 @@ USAGE = """usage:
   tldv meeting <id>                      ミーティング単体
   tldv transcript <id>                   文字起こし
   tldv notes <id>                        AI ノート
+  tldv highlights <id>                   ハイライト
   tldv download <id>                     録画の署名付き URL を表示
   tldv get <path> [k=v ...] [--all]      任意の GET
 
 path は v1alpha1 が補われる (例: `tldv get meetings page=2 limit=100`)。
-API は alpha 版。
+API は alpha 版。--all は最後まで辿れなかったら exit 1 になる (出力は途中まで)。
 
 meetings が受け付けるパラメータ (これ以外は黙って無視される):
   page, limit (最大 100), from, to (ISO 日付), meetingType (internal|external), query
@@ -224,7 +287,10 @@ def main():
         return
     env = load_env()
     if cmd == "health":
-        out(call(env, "GET", "health"))
+        res = call(env, "GET", "health")
+        out(res)
+        if isinstance(res, dict) and res.get("url"):
+            die("転送されました。疎通していません（キャプティブポータル等）")
     elif cmd == "meetings":
         cmd_meetings(env, args)
     elif cmd == "meeting":
@@ -237,6 +303,8 @@ def main():
         cmd_get(env, args)
     else:
         die(f"未知のコマンド: {cmd}\n\n{USAGE}")
+    if _incomplete:
+        die(f"--all が最後まで辿れませんでした（{_incomplete}）。出力は途中までです")
 
 
 if __name__ == "__main__":
