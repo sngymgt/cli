@@ -65,7 +65,7 @@ def post_form(url, params):
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     try:
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.build_opener(_NoRedirect).open(req) as res:
             return json.loads(res.read().decode())
     except urllib.error.HTTPError as e:
         die(f"{url} -> {e.code} {e.read().decode()[:500]}")

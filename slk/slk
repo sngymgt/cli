@@ -216,7 +216,10 @@ def _http(method, verb, token, params):
     if wait > 0:
         time.sleep(wait)
     _last_call = time.time()
-    with urllib.request.urlopen(req) as res:
+    # 既定の opener は転送先が別ホストでも Authorization を持ち回るので、追わせない。
+    # ここで運ぶのは失効しないユーザートークン
+    opener = urllib.request.build_opener(_NoRedirect)
+    with opener.open(req) as res:
         return json.loads(res.read().decode())
 
 
@@ -1280,7 +1283,7 @@ def oauth_exchange(app, secret, code):
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("User-Agent", USER_AGENT)
     try:
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.build_opener(_NoRedirect).open(req) as res:
             blob = json.loads(res.read().decode())
     except urllib.error.HTTPError as e:
         die(f"oauth.v2.access -> HTTP {e.code} {e.read().decode()[:300]}")
