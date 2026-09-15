@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import secrets
 import sys
 import time
@@ -55,6 +56,8 @@ TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")
 
 # 各エンドポイント 1 秒 3 回が上限（超過で 429）。請求書・会計とも同じで、
 # アクセストークン単位の計測なので両サービスを跨いでこの間隔を守る必要がある。
+# 会計の仕訳を会計期間を跨いで引くと 400 "Given date is not matching any accounting
+# periods" になる。期の区切りは不規則なので term_settings から読むこと（決め打ちしない）
 MIN_INTERVAL = 0.34
 _last_call = 0.0
 
@@ -67,9 +70,28 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# 取り切れずに返したときの理由。取れた分は出したうえで exit 1 にする
+_incomplete = None
+
+
 def die(msg):
     print(f"mf: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def incomplete(msg):
+    global _incomplete
+    _incomplete = msg
+    print(f"# {msg}", file=sys.stderr)
+
+
+def secure(path, mode):
+    """権限を必ず mode まで絞る。makedirs(mode=) は既存ディレクトリには効かず、
+    作成時の mode も umask で削られるので、実行のたびに現在値を見て直す。"""
+    current = stat.S_IMODE(os.stat(path).st_mode)
+    if current != mode:
+        os.chmod(path, mode)
+        print(f"# {path} の権限を {current:04o} から {mode:04o} に直しました", file=sys.stderr)
 
 
 def default_scope():
@@ -77,6 +99,10 @@ def default_scope():
 
 
 def load_env():
+    if os.path.isdir(CONFIG_DIR):
+        secure(CONFIG_DIR, 0o700)
+    if os.path.exists(ENV_PATH):
+        secure(ENV_PATH, 0o600)
     if not os.path.exists(ENV_PATH):
         die(f"{ENV_PATH} がありません。MF_CLIENT_ID / MF_CLIENT_SECRET を書いてください")
     env = {}
@@ -96,11 +122,20 @@ def load_env():
 
 
 def save_tokens(tokens):
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    secure(CONFIG_DIR, 0o700)
     tmp = TOKENS_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(tokens, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, TOKENS_PATH)
+    # open() してから chmod すると、その間は umask の権限（通常 0644）で
+    # refresh_token が他人に読める。作成時の mode で 0600 を確定させる
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(tokens, f, indent=2)
+        os.replace(tmp, TOKENS_PATH)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def load_tokens():
@@ -290,11 +325,18 @@ def envelope(body):
     請求書は `data` + `pagination`、会計はエンドポイント名のキー（`journals` 等）+ `metadata`
     と封筒が違うので、キー名を決め打ちにできない。
     """
+    if not isinstance(body, dict):
+        die(f"ページングできるレスポンスではありません: {str(body)[:200]}")
     meta = body.get("pagination") or body.get("metadata") or {}
     if isinstance(body.get("data"), list):
         key = "data"
     else:
-        key = next((k for k, v in body.items() if isinstance(v, list)), None)
+        # 候補が複数のとき JSON の並び順で選ぶと、関係ない配列（warnings 等）を
+        # 伸ばして本命を 1 ページ目のまま返す。決められないなら決めない
+        cands = [k for k, v in body.items() if isinstance(v, list)]
+        if len(cands) > 1:
+            die(f"どの配列を辿るか決められません（{'/'.join(cands)}）")
+        key = cands[0] if cands else None
     if key is None:
         die(f"ページングできるレスポンスではありません: キー {list(body)}")
     return key, body[key], meta.get("total_pages")
@@ -309,11 +351,19 @@ def parse_query(argv):
             fetch_all = True
         elif arg == "--data":
             i += 1
+            if i >= len(argv):
+                die("--data に値がありません")
             raw = argv[i]
             if raw.startswith("@"):
-                with open(os.path.expanduser(raw[1:])) as f:
+                path = os.path.expanduser(raw[1:])
+                if not os.path.exists(path):
+                    die(f"--data のファイルがありません: {path}")
+                with open(path) as f:
                     raw = f.read()
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except ValueError as ex:
+                die(f"--data が JSON ではありません: {ex}")
         elif "=" in arg:
             k, v = arg.split("=", 1)
             query[k] = v
@@ -331,13 +381,26 @@ def cmd_http(env, service, method, argv):
     require_scopes(service)
 
     if fetch_all:
+        if "page" in query:
+            die("--all と page= は同時に指定できません")
         items, key, page = [], "data", 1
         while True:
             query["page"] = page
             query.setdefault("per_page", 100)
             key, chunk, total_pages = envelope(api_call(env, service, method, path, query, data))
             items.extend(chunk)
-            if page >= (total_pages or page):
+            # total_pages が無いまま `page >= (total_pages or page)` と書くと
+            # 1 >= 1 で必ず 1 ページ目で抜け、途中までを完全な取得として返してしまう
+            if total_pages is None:
+                if chunk:
+                    incomplete(f"total_pages が無いので {len(items)} 件で打ち切りました")
+                break
+            try:
+                total_pages = int(total_pages)
+            except (TypeError, ValueError):
+                incomplete(f"total_pages が数値ではありません: {total_pages!r}")
+                break
+            if page >= total_pages:
                 break
             page += 1
         print(json.dumps({key: items, "count": len(items)}, ensure_ascii=False, indent=2))
@@ -367,7 +430,12 @@ path は各サービスの /api/v3 以下。
   mf invoice get billings from=2026-08-01 to=2026-08-31 range_key=billing_date --all
   mf accounting get offices
   mf accounting get reports/transition_pl type=monthly fiscal_year=2026
-  mf accounting get journals from=2026-04-01 to=2026-08-31 --all
+  mf accounting get journals start_date=2026-04-01 end_date=2026-08-31 --all
+
+--all は最後まで辿れなかったら exit 1 になる（出力は途中まで）。
+会計の期間は start_date / end_date、請求書は from / to。名前を間違えても
+エラーにならず全件が返るので注意。
+MF_NO_PKCE=1 で PKCE を外せる（認可サーバ側の不調時の回避用。常用しない）。
 """
 
 
@@ -394,6 +462,8 @@ def main():
     if method not in ("get", "post", "put", "delete"):
         die(f"不明なメソッド: {method}")
     cmd_http(env, service, method.upper(), rest)
+    if _incomplete:
+        die(f"--all が最後まで辿れませんでした（{_incomplete}）。出力は途中までです")
 
 
 if __name__ == "__main__":
