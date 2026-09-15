@@ -39,6 +39,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,6 +55,11 @@ MAX_REDIRECTS = 5
 
 USER_AGENT = "zp-cli/1.0"
 
+# レート制限が公開されていないため、こちらから間隔を空けて叩く。probe はユーザー数だけ、
+# --all はページ数だけ連続して投げるので、間隔が無いと簡単に 429 を踏む
+MIN_INTERVAL = 0.2
+_last_call = 0.0
+
 # 拡張子は Content-Type から決める。録音は mp3 だが m4a が返ることがある
 EXT_BY_TYPE = {"audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/mp4": "m4a",
                "audio/x-m4a": "m4a", "audio/wav": "wav", "audio/x-wav": "wav"}
@@ -62,6 +68,14 @@ EXT_BY_TYPE = {"audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/mp4": "m4a",
 def die(msg):
     print(f"zp: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def throttle():
+    global _last_call
+    wait = MIN_INTERVAL - (time.time() - _last_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call = time.time()
 
 
 def note(msg):
@@ -107,9 +121,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# --all が最後まで辿れなかった理由。取れた分は出したうえで exit 1 にするために持つ
+_incomplete = None
+
 # S2S のトークンは 1 時間で、1 回の実行の中でしか使わない。ディスクに置くと
 # 秘密の置き場所が増えるだけなので、プロセス内にしか持たない
 _token = None
+# 取り直す時刻。--all が 1 時間を跨ぐと、持ち回した token が途中で 401 になる
+_token_exp = 0.0
 # トークンと一緒に返る、このアカウントの API ホスト。api.zoom.us とは限らない
 _api_base = None
 
@@ -127,8 +146,8 @@ def zoom_host(url):
 
 
 def access_token(env, verbose=False):
-    global _token, _api_base
-    if _token:
+    global _token, _token_exp, _api_base
+    if _token and time.time() < _token_exp:
         return _token
     body = urllib.parse.urlencode({
         "grant_type": "account_credentials",
@@ -140,6 +159,7 @@ def access_token(env, verbose=False):
     req.add_header("Authorization", f"Basic {basic}")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("User-Agent", USER_AGENT)
+    throttle()
     # 既定の opener は転送を追い、Authorization を転送先へ持ち回る。ここで運ぶのは
     # 1 時間で切れるトークンではなく client_secret なので、追わずに 3xx で止める
     opener = urllib.request.build_opener(_NoRedirect)
@@ -154,6 +174,8 @@ def access_token(env, verbose=False):
     if not isinstance(payload, dict) or "access_token" not in payload:
         die(f"access_token が返りませんでした: {json.dumps(payload, ensure_ascii=False)}")
     _token = payload["access_token"]
+    # 期限ちょうどに取り直すと往復の間に切れるので手前に寄せる
+    _token_exp = time.time() + max(int(payload.get("expires_in") or 3600) - 60, 0)
     returned = (payload.get("api_url") or "").rstrip("/")
     if returned and not zoom_host(returned):
         die(f"トークンが zoom.us 以外の api_url を返しました: {returned}")
@@ -193,6 +215,7 @@ def fetch(env, path, params=None, timeout=180):
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
     headers = {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
+    throttle()
     opener = urllib.request.build_opener(_NoRedirect)
     for _ in range(MAX_REDIRECTS + 1):
         req = urllib.request.Request(url, method="GET")
@@ -254,16 +277,31 @@ def check(status, body, path):
     return body
 
 
+def list_candidates(body):
+    return [k for k, v in body.items() if isinstance(v, list) and k != "errors"]
+
+
 def list_key(body):
-    """一覧の中身が入っているキー。Zoom はエンドポイントごとに名前が違う。"""
-    for k, v in body.items():
-        if isinstance(v, list) and k not in ("errors",):
+    """一覧の中身が入っているキー。Zoom はエンドポイントごとに名前が違う。
+
+    候補が複数あるときに JSON の並び順で選ぶと、--all が関係ない配列を伸ばして本命を
+    1 ページ目のまま返す。並び順は権威ではないので、決め打ちできるときだけ返す。"""
+    cands = list_candidates(body)
+    if len(cands) == 1:
+        return cands[0]
+    for k in ("recordings", "users", "call_logs", "call_history"):
+        if k in cands:
             return k
     return None
 
 
 def paged(env, path, params, fetch_all):
-    """--all のときだけ next_page_token を追う。戻り値は最後の応答に全件を詰めたもの。"""
+    """--all のときだけ next_page_token を追う。戻り値は最後の応答に全件を詰めたもの。
+
+    最後まで辿れなかったときは `next_page_token` を残したまま返し、`_incomplete` を立てて
+    main() が exit 1 にする。途中までの JSON を 0 で返すと、`--all > out.json` が
+    完全な取得と見分けられなくなる (note は stderr なのでリダイレクトで消える)。"""
+    global _incomplete
     params = dict(params or {})
     params.setdefault("page_size", 100 if fetch_all else 30)
     status, body = call(env, path, params)
@@ -273,7 +311,10 @@ def paged(env, path, params, fetch_all):
     key = list_key(body)
     if key is None:
         if body.get("next_page_token"):
-            note("配列のキーが見つからないので 1 ページ目だけ返します (--all が効いていません)")
+            cands = "/".join(list_candidates(body)) or "配列なし"
+            _incomplete = (f"{path}: 一覧のキーを判定できないので ({cands}) "
+                           "1 ページ目しか辿れませんでした")
+            note(_incomplete)
         return body
     items = list(body[key])
     token = body.get("next_page_token")
@@ -282,7 +323,9 @@ def paged(env, path, params, fetch_all):
         # 同じトークンを返し続けるエンドポイントがあると終端条件が来ない。件数では
         # 止まらないので、トークンそのものの再出現で打ち切る
         if token in seen:
-            note(f"next_page_token が繰り返されたので {len(items)} 件で打ち切りました")
+            _incomplete = (f"{path}: next_page_token が繰り返されたので "
+                           f"{len(items)} 件で打ち切りました")
+            note(_incomplete)
             break
         seen.add(token)
         params["next_page_token"] = token
@@ -294,7 +337,8 @@ def paged(env, path, params, fetch_all):
         items += page.get(key, [])
         token = page.get("next_page_token")
     body[key] = items
-    body["next_page_token"] = ""
+    # 打ち切ったときは残りがあることを出力にも残す。空にすると「続きが無い」と同じ形になる
+    body["next_page_token"] = token if _incomplete else ""
     return body
 
 
@@ -321,10 +365,17 @@ def kv(args):
     params = {}
     for a in args:
         if "=" not in a:
+            if a.startswith("-"):
+                die(f"未知のオプション: {a}")
             die(f"不正な引数: {a} (key=value 形式)")
         k, v = a.split("=", 1)
         params[k] = v
     return params
+
+
+def is_date(s):
+    parts = s.split("-")
+    return len(s) == 10 and len(parts) == 3 and all(p.isdigit() for p in parts)
 
 
 def default_range():
@@ -346,19 +397,31 @@ def with_range(params):
 
 
 def cmd_health(env, args):
+    """疎通の確認そのものなので、NG があれば exit 1 にする。`zp health && ...` が
+    資格情報の壊れた状態で次へ進まないようにするため。"""
     access_token(env, verbose=True)
     print()
+    bad = []
     for path in ("phone/users", "phone/account_settings"):
         status, body = call(env, path, {"page_size": 1} if path.endswith("users") else None)
         detail = ""
-        if status != 200 and isinstance(body, dict):
-            detail = f"  {body.get('code')} {body.get('message')}"
+        if status != 200:
+            bad.append(path)
+            if isinstance(body, dict):
+                detail = f"  {body.get('code')} {body.get('message')}"
         print(f"{'ok' if status == 200 else 'NG'} [{status}] {path}{detail}")
+    if bad:
+        die(f"疎通できないエンドポイントがあります: {', '.join(bad)}")
 
 
 def cmd_probe(env, args):
     """使える経路を総当たりで確かめる。ファイル冒頭のとおり、録音系はアカウントによって
     通るエンドポイントが違うので、実装の前にここで当たりを取る。"""
+    if len(args) > 2:
+        die("usage: zp probe [FROM] [TO]")
+    for a in args:
+        if not is_date(a):
+            die(f"日付は YYYY-MM-DD で指定してください: {a}")
     frm, to = default_range()
     if len(args) >= 1:
         frm = args[0]
@@ -540,15 +603,16 @@ USAGE = """usage:
   zp probe [FROM] [TO]                   使える経路を総当たりで確認する (既定は直近 7 日)
   zp users [k=v ...] [--all]             Zoom Phone ユーザー一覧
   zp recordings [k=v ...] [--all]        録音一覧 (from/to 省略時は直近 7 日)
-  zp history [k=v ...] [--all]           通話履歴 (phone/call_history)
+  zp history [k=v ...] [--all]           通話履歴 (同上)
   zp transcript <recordingId>            文字起こしを返ってきたまま表示
-  zp download <download_url> [-o <先>|-] [--force]      録音の音声を保存
+  zp download <download_url> [-o|--output <先>|-] [--force]  録音の音声を保存
                                          （一覧が返す download_url をそのまま渡す。
                                            録音の id からは組み立てられない）
   zp get <path> [k=v ...] [--all]        任意の GET
 
 path は v2 が補われる (例: `zp get phone/users/<userId>/recordings from=2026-09-01`)。
-from / to は YYYY-MM-DD。
+from / to は YYYY-MM-DD で、片方だけ書くともう片方は補われない。
+--all は最後まで辿れなかったら exit 1 になる (出力は途中まで)。
 
 録音系はアカウントによって通るエンドポイントが違う。実装の前に `zp probe` で当たりを取る。
 文字起こしの言語はユーザー設定の「デフォルトの文字起こし言語」で決まり、既定は英語
@@ -590,6 +654,9 @@ def main():
         die("中断しました")
     except BrokenPipeError:
         os._exit(0)
+    if _incomplete:
+        die(f"--all が最後まで辿れませんでした ({_incomplete})。"
+            "出力は途中までです")
 
 
 if __name__ == "__main__":

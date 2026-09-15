@@ -42,6 +42,15 @@ git 履歴は force-push しても GitHub 上に SHA で残る。入れてしま
   302 で POST→GET になって落ちるが、`Authorization` ヘッダは転送先まで付いて行く。
   ヘッダに資格情報を載せるなら `_NoRedirect` を挿した opener を使う（`mf` と `zp`）
 
+zp について:
+
+- **`--all` が最後まで辿れなかったら exit 0 で返さない。** 途中までの JSON を 0 で返すと
+  `--all > out.json` が完全な取得と区別できない。`note` は stderr なのでリダイレクトで消える
+- **`list_key()` で候補が複数のとき JSON の並び順で選ばない。** 関係ない配列を伸ばして
+  本命を 1 ページ目のまま返す。決められないなら決めずに exit 1 へ倒す
+- **`zp health` を exit 0 に戻さない。** 疎通の確認そのものなので、
+  `zp health && ...` が壊れた資格情報で次へ進む
+
 slk について:
 
 - **`READ_METHODS` に書き込みメソッドを足さない。** manifest が書き込み scope を要求しないことと
