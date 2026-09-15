@@ -3,6 +3,7 @@
 
 import json
 import os
+import stat
 import sys
 import time
 import urllib.error
@@ -18,6 +19,25 @@ MIN_INTERVAL = 0.2
 _last_call = 0.0
 
 
+# 取り切れずに返したときの理由。取れた分は出したうえで exit 1 にする
+_incomplete = None
+
+
+def incomplete(msg):
+    global _incomplete
+    _incomplete = msg
+    print(f"# {msg}", file=sys.stderr)
+
+
+def secure(path, mode):
+    """権限を必ず mode まで絞る。makedirs(mode=) は既存ディレクトリには効かず、
+    作成時の mode も umask で削られるので、実行のたびに現在値を見て直す。"""
+    current = stat.S_IMODE(os.stat(path).st_mode)
+    if current != mode:
+        os.chmod(path, mode)
+        print(f"# {path} の権限を {current:04o} から {mode:04o} に直しました", file=sys.stderr)
+
+
 def die(msg):
     print(f"zoho: {msg}", file=sys.stderr)
     sys.exit(1)
@@ -26,6 +46,9 @@ def die(msg):
 def load_env():
     if not os.path.exists(ENV_PATH):
         die(f"{ENV_PATH} がありません。`zoho init` を実行してください")
+    # ファイルだけ閉じても、ディレクトリが書ける状態なら env ごと差し替えられる
+    secure(CONFIG_DIR, 0o700)
+    secure(ENV_PATH, 0o600)
     env = {}
     with open(ENV_PATH) as f:
         for line in f:
@@ -39,18 +62,31 @@ def load_env():
             die(f"{ENV_PATH} に {key} がありません")
     env.setdefault("ZOHO_DC", "jp")
     dc = env["ZOHO_DC"]
+    # client_secret を送る先のホスト名になるので、既知のデータセンターだけ許す
+    if dc not in ("jp", "com", "eu", "in", "com.au", "com.cn", "ca"):
+        die(f"ZOHO_DC が不正です: {dc}")
     env.setdefault("ZOHO_ACCOUNTS_BASE", f"https://accounts.zoho.{dc}")
     env.setdefault("ZOHO_API_BASE", f"https://www.zohoapis.{dc}")
     env.setdefault("ZOHO_API_VERSION", "v8")
+    for k in ("ZOHO_ACCOUNTS_BASE", "ZOHO_API_BASE"):
+        env[k] = env[k].rstrip("/")
     return env
 
 
 def save_tokens(tokens):
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    secure(CONFIG_DIR, 0o700)
     tmp = TOKENS_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(tokens, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, TOKENS_PATH)
+    # open() してから chmod すると、その間は umask の権限で refresh_token が読める
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(tokens, f, indent=2)
+        os.replace(tmp, TOKENS_PATH)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def load_tokens():
@@ -65,10 +101,16 @@ def post_form(url, params):
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     try:
-        with urllib.request.build_opener(_NoRedirect).open(req) as res:
-            return json.loads(res.read().decode())
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=60) as res:
+            raw = res.read().decode(errors="replace")
+            try:
+                return json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                die(f"{url} -> JSON が返りませんでした: {raw[:300]}")
     except urllib.error.HTTPError as e:
-        die(f"{url} -> {e.code} {e.read().decode()[:500]}")
+        die(f"{url} -> {e.code} {e.read().decode(errors='replace')[:500]}")
+    except urllib.error.URLError as e:
+        die(f"Zoho に接続できません: {e.reason}")
 
 
 def token_endpoint(env):
@@ -85,7 +127,11 @@ def cmd_auth(env, args):
         "code": args[0],
     })
     if "refresh_token" not in res:
-        die(f"refresh_token が返りませんでした: {json.dumps(res, ensure_ascii=False)}")
+        # res をそのまま出すと access_token が端末とスクロールバックに残る。
+        # offline アクセス無しの grant token だと access_token だけが返る
+        detail = res.get("error") or f"返ったキー: {', '.join(res)}"
+        die(f"refresh_token が返りませんでした（{detail}）。"
+            "grant token を offline アクセスで作り直してください")
     save_tokens({
         "access_token": res["access_token"],
         "refresh_token": res["refresh_token"],
@@ -163,11 +209,17 @@ def call(env, method, path, params=None, body=None, _retried=False):
     _last_call = time.time()
     opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with opener.open(req) as res:
-            raw = res.read().decode()
-            return json.loads(raw) if raw.strip() else {}
+        with opener.open(req, timeout=120) as res:
+            raw = res.read().decode(errors="replace")
+            if not raw.strip():
+                return {}
+            try:
+                return json.loads(raw)
+            except ValueError:
+                die(f"{method} {url} -> JSON が返りませんでした: {raw[:300]}")
     except urllib.error.HTTPError as e:
-        raw = e.read().decode()
+        # HTTPError は URLError の派生。この順序を入れ替えると 3xx と 401 の処理が死ぬ
+        raw = e.read().decode(errors="replace")
         if 300 <= e.code < 400:
             die(f"{method} {url} -> {e.code} リダイレクトは追いません"
                 f"（転送先: {e.headers.get('Location')}）")
@@ -175,15 +227,22 @@ def call(env, method, path, params=None, body=None, _retried=False):
             access_token(env, force=True)
             return call(env, method, path, params, body, _retried=True)
         die(f"{method} {url} -> {e.code} {raw[:1000]}")
+    except urllib.error.URLError as e:
+        die(f"Zoho に接続できません: {e.reason}")
 
 
 def data_key(res):
-    if "data" in res and isinstance(res["data"], list):
+    """--all で辿る配列のキー。
+
+    候補が複数のとき JSON の並び順で選ぶと、関係ない配列を伸ばして本命を 1 ページ目の
+    まま返す。決め打ちできるときだけ返し、駄目なら呼び出し側で打ち切りに倒す。
+    """
+    if not isinstance(res, dict):
+        return None
+    if isinstance(res.get("data"), list):
         return "data"
-    for k, v in res.items():
-        if k != "info" and isinstance(v, list):
-            return k
-    return None
+    cands = [k for k, v in res.items() if k != "info" and isinstance(v, list)]
+    return cands[0] if len(cands) == 1 else None
 
 
 def cmd_get(env, args):
@@ -203,20 +262,42 @@ def cmd_get(env, args):
         return
     key = data_key(res)
     if key is None:
+        cands = [k for k, v in res.items() if k != "info" and isinstance(v, list)] \
+            if isinstance(res, dict) else []
+        if (res.get("info") or {}).get("more_records") if isinstance(res, dict) else False:
+            incomplete(f"辿る配列を決められないので 1 ページ目だけ返します"
+                       f"（{'/'.join(cands) or '配列なし'}）")
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return
     rows = list(res[key])
     info = res.get("info") or {}
+    seen = set()
     while info.get("more_records"):
-        if info.get("next_page_token"):
-            params["page_token"] = info["next_page_token"]
+        token = info.get("next_page_token")
+        if token:
+            if token in seen:
+                incomplete(f"next_page_token が繰り返されたので {len(rows)} 件で打ち切りました")
+                break
+            seen.add(token)
+            params["page_token"] = token
         else:
+            # 使い終わった page_token を残したまま page を足すと、Zoho はトークンを
+            # 優先して page を無視するので、同じページを永久に取り直す
+            params.pop("page_token", None)
             params["page"] = int(params.get("page", 1)) + 1
         res = call(env, "GET", path, params)
-        rows.extend(res.get(key) or [])
+        chunk = res.get(key)
+        if not isinstance(chunk, list):
+            incomplete(f"2 ページ目以降に {key} がありません。{len(rows)} 件で打ち切りました")
+            break
+        rows.extend(chunk)
         info = res.get("info") or {}
         print(f"  ... {len(rows)} 件", file=sys.stderr)
-    print(json.dumps({key: rows, "info": {"count": len(rows)}}, ensure_ascii=False, indent=2))
+    # 元の応答の他のフィールドを落とさない（key 以外を黙って捨てていた）
+    out = {k: v for k, v in res.items() if k not in (key, "info")}
+    out[key] = rows
+    out["info"] = {"count": len(rows)}
+    print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
 def read_body(args):
@@ -233,10 +314,35 @@ def read_body(args):
 
 
 def cmd_write(env, method, args):
+    opts = [a for a in args if a in ("-y", "--yes")]
+    args = [a for a in args if a not in ("-y", "--yes")]
     if not args:
-        die(f"usage: zoho {method.lower()} <path> [@file | - | '<json>']")
+        die(f"usage: zoho {method.lower()} <path> [@file | - | '<json>'] [-y]")
+    if method == "DELETE" and not opts:
+        if not sys.stdin.isatty():
+            die("DELETE は確認が要ります。非対話で実行するなら -y を付けてください")
+        base = env["ZOHO_API_BASE"]
+        print(f"{method} {base}/crm/{env['ZOHO_API_VERSION']}/{args[0].lstrip('/')}",
+              file=sys.stderr)
+        if input("本番の CRM を変更します。よろしいですか? [y/N] ").strip().lower() \
+                not in ("y", "yes"):
+            die("中止しました")
     res = call(env, method, args[0], body=read_body(args[1:]) if method != "DELETE" or args[1:] else None)
     print(json.dumps(res, ensure_ascii=False, indent=2))
+    check_write_result(res)
+
+
+def check_write_result(res):
+    """一括 API は HTTP 200 の中にレコード単位の失敗を返す。ここを見ないと
+    全件拒否でも exit 0 になり、`zoho patch … && 次の処理` がそのまま進む。"""
+    rows = res.get("data") if isinstance(res, dict) else None
+    if not isinstance(rows, list):
+        return
+    bad = [r for r in rows
+           if isinstance(r, dict) and str(r.get("status", "")).lower() == "error"]
+    if bad:
+        codes = sorted({str(r.get("code")) for r in bad})
+        die(f"{len(rows)} 件中 {len(bad)} 件が失敗しました（{', '.join(codes)}）")
 
 
 def cmd_coql(env, args):
@@ -244,20 +350,30 @@ def cmd_coql(env, args):
         die("usage: zoho coql \"select ... from Accounts where ...\"")
     res = call(env, "POST", "coql", body={"select_query": args[0]})
     print(json.dumps(res, ensure_ascii=False, indent=2))
+    # COQL は 1 回 200 件が上限で、--all も無い。黙って上限で切れたと思わせない
+    if (res.get("info") or {}).get("more_records"):
+        incomplete("COQL は 1 回 200 件までです。LIMIT / OFFSET で分けてください")
 
 
-def cmd_init(env_missing_ok=True):
+def cmd_init():
+    # CONFIG_DIR を作らないまま open すると、新しいマシンでは README の手順 1 が
+    # FileNotFoundError で落ちる
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    secure(CONFIG_DIR, 0o700)
     if os.path.exists(ENV_PATH):
+        secure(ENV_PATH, 0o600)
         print(f"既に {ENV_PATH} があります")
         return
-    with open(ENV_PATH, "w") as f:
+    # exists と open("w") を分けると、その隙に作られた env を切り詰めて
+    # client_secret を失う。O_EXCL で名前の確保ごと不可分にする
+    fd = os.open(ENV_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(
             "# https://api-console.zoho.jp/ の Self Client で発行した値\n"
             "ZOHO_CLIENT_ID=\n"
             "ZOHO_CLIENT_SECRET=\n"
             "ZOHO_DC=jp\n"
         )
-    os.chmod(ENV_PATH, 0o600)
     print(f"{ENV_PATH} を作成しました。CLIENT_ID / CLIENT_SECRET を記入してください")
 
 
@@ -296,6 +412,8 @@ def main():
         cmd_coql(env, args)
     else:
         die(f"未知のコマンド: {cmd}\n\n{USAGE}")
+    if _incomplete:
+        die(f"取り切れませんでした（{_incomplete}）。出力は途中までです")
 
 
 if __name__ == "__main__":
