@@ -117,6 +117,38 @@ REDIRECT_SCHEMES = ("https",)
 
 G = {}
 
+# 取り切れずに返したときの理由。取れた分は出したうえで exit 1 にする。
+# note は stderr なので `--all > out.json` では消え、完全な取得と区別できなくなる
+_incomplete = None
+
+
+def incomplete(msg):
+    global _incomplete
+    _incomplete = msg
+    warn(msg)
+
+
+def as_json(data):
+    """200 でも JSON とは限らない（キャプティブポータル・プロキシの HTML）。
+    その場合に JSONDecodeError のトレースバックで落とさない。"""
+    text = data.decode(errors="replace") if isinstance(data, bytes) else data
+    try:
+        return json.loads(text) if text.strip() else {}
+    except ValueError:
+        die(f"JSON が返りませんでした: {text[:300]}")
+
+
+def opt_int(opts, name, default, minimum=1):
+    """数値オプションを読む。打ち間違いを ValueError のトレースバックにしない。"""
+    raw = opts.get(name, default)
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        die(f"{name} には整数を指定してください: {raw}")
+    if v < minimum:
+        die(f"{name} は {minimum} 以上で指定してください: {v}")
+    return v
+
 
 def die(msg):
     print(f"slk: {msg}", file=sys.stderr)
@@ -219,19 +251,25 @@ def _http(method, verb, token, params):
     # 既定の opener は転送先が別ホストでも Authorization を持ち回るので、追わせない。
     # ここで運ぶのは失効しないユーザートークン
     opener = urllib.request.build_opener(_NoRedirect)
-    with opener.open(req) as res:
-        return json.loads(res.read().decode())
+    with opener.open(req, timeout=60) as res:
+        return as_json(res.read())
 
 
 def call(token, method, params=None, _verb=None, _tries=0):
-    verb = _verb or READ_METHODS.get(method)
-    if verb is None:
+    # allowlist の判定を _verb より先に置く。_verb が真なら素通りする形にすると、
+    # 将来 _verb を渡す呼び出しが 1 つ増えただけで read-only の保証が消える
+    if method not in READ_METHODS:
         die(f"{method} は read-only の allowlist にありません（slk api help で一覧）")
+    verb = _verb or READ_METHODS[method]
     try:
         res = _http(method, verb, token, params)
     except urllib.error.HTTPError as e:
         if e.code == 429 and _tries < MAX_RETRY:
-            delay = int(e.headers.get("Retry-After") or 30)
+            try:
+                delay = int(e.headers.get("Retry-After") or 30)
+            except ValueError:
+                delay = 30          # HTTP-date 形式（プロキシや CDN が返す）
+            delay = max(1, min(delay, 120))
             warn(f"{method}: レート制限。{delay}s 待って再試行します")
             time.sleep(delay + 1)
             return call(token, method, params, _verb, _tries + 1)
@@ -314,10 +352,10 @@ def token_where(name):
 
 def write_env_stub(dir_):
     path = os.path.join(dir_, "env")
-    with open(path, "w") as f:
+    fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(f"# トークンは macOS Keychain にあります"
                 f"（service={KEYCHAIN_SERVICE} / account={os.path.basename(dir_)}）\n")
-    os.chmod(path, 0o600)
 
 
 def profile_dir(name):
@@ -394,6 +432,14 @@ class Profile:
     def _cache_path(self, kind):
         return os.path.join(self.dir, "cache", f"{kind}.json")
 
+    def _cached_items(self, kind):
+        """ディスクから読んだ items をプロセス内に留める。ここを都度読み直すと、
+        描画が 1 メッセージあたり数百 KB の JSON パース 1 回になる。"""
+        attr = f"_items_{kind}"
+        if getattr(self, attr, None) is None:
+            setattr(self, attr, self._cache_read(kind)["items"])
+        return getattr(self, attr)
+
     def _cache_read(self, kind):
         path = self._cache_path(kind)
         if not os.path.exists(path):
@@ -410,15 +456,20 @@ class Profile:
         path = self._cache_path(kind)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w") as f:
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(blob, f, ensure_ascii=False)
         os.replace(tmp, path)
+
+    def _invalidate(self, kind):
+        setattr(self, f"_items_{kind}", None)
 
     def _merge(self, kind, key, value):
         """id 解決の 1 件を足すだけ。ts は動かさない（動かすと一覧が永久に再取得されない）。"""
         blob = self._cache_read(kind)
         blob["items"][key] = value
         self._cache_write(kind, blob)
+        self._invalidate(kind)
         return value
 
     def user_index(self, refresh=False):
@@ -448,7 +499,7 @@ class Profile:
         return self._channels
 
     def user_name(self, uid):
-        items = self._users if self._users is not None else self._cache_read("users")["items"]
+        items = self._users if self._users is not None else self._cached_items("users")
         row = items.get(uid)
         if row is None and not items:
             # 1 件も持っていない状態で 1 件ずつ users.info を叩くと DM 一覧だけで数十回になる
@@ -490,7 +541,7 @@ class Profile:
         return self.display_channel(cid, row)
 
     def display_channel(self, cid, row=None):
-        row = row or self._cache_read("channels")["items"].get(cid) or {}
+        row = row or self._cached_items("channels").get(cid) or {}
         if row.get("type") == "im":
             return "@" + (self.user_name(row["user"]) if row.get("user") else cid)
         return "#" + (row.get("name") or cid)
@@ -499,8 +550,10 @@ class Profile:
     def resolve_user(self, spec):
         if ID_RE.match(spec):
             return spec
-        if "@" in spec and "." in spec.split("@")[-1]:
-            return self.call("users.lookupByEmail", {"email": spec})["user"]["id"]
+        # 先頭の @ は Slack のハンドル表記なので、それを除いた残りに @ がある時だけ
+        # メールアドレスとみなす。@first.last は lookupByEmail に送らない
+        if "@" in spec.lstrip("@") and "." in spec.rsplit("@", 1)[-1]:
+            return self.call("users.lookupByEmail", {"email": spec.lstrip("@")})["user"]["id"]
         needle = spec.lstrip("@").lower()
         items = self.user_index()
         exact = [uid for uid, r in items.items()
@@ -624,8 +677,12 @@ def channel_row(c):
 
 
 def paginate(prof, method, params, key, cap=None):
-    """cursor 方式の一覧をまとめて取る。"""
-    rows, params = [], dict(params)
+    """cursor 方式の一覧をまとめて取る。
+
+    cursor を持たないメソッド（`files.list` や `search.*` は `paging` 方式）を渡されても
+    1 ページ目で終わってしまうので、取り切れていないと分かる形なら incomplete に倒す。
+    """
+    rows, params, seen = [], dict(params), set()
     while True:
         res = prof.call(method, params)
         rows.extend(res.get(key) or [])
@@ -633,7 +690,15 @@ def paginate(prof, method, params, key, cap=None):
             return rows[:cap]
         cursor = (res.get("response_metadata") or {}).get("next_cursor")
         if not cursor:
+            paging = res.get("paging") or {}
+            if (paging.get("pages") or 1) > 1:
+                incomplete(f"{method}: cursor 方式ではないので 1 ページ目しか取れません"
+                           f"（全 {paging.get('pages')} ページ）")
             return rows
+        if cursor in seen:
+            incomplete(f"{method}: next_cursor が繰り返されたので {len(rows)} 件で打ち切りました")
+            return rows
+        seen.add(cursor)
         params["cursor"] = cursor
         if len(rows) >= 1000:
             note(f"{method}: {len(rows)} 件 …")
@@ -807,15 +872,14 @@ def cmd_file(prof, args):
         # 存在確認と書き込みを分けると、その隙に作られたファイルを潰す。O_EXCL で
         # 名前の確保そのものを不可分にする
         try:
-            out = open(dest, "xb")
+            # 添付は機微なので --force 経路（mkstemp は 0600）と権限を揃える。
+            # open("xb") のままだと umask 次第で他人に読める
+            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             die(f"既にあります: {dest}（上書きするなら --force）")
         try:
-            with out as f:
+            with os.fdopen(fd, "wb") as f:
                 shutil.copyfileobj(fetch_binary(url, prof.token), f)
-                # 別のプロセスが同じ名前に書いていた場合に、その残りが末尾に付いたままに
-                # ならないよう、書いた長さで切る
-                f.truncate()
         except BaseException:
             # ここで消してよいのは、この呼び出しが作ったファイルだと確定しているため
             if os.path.exists(dest):
@@ -845,14 +909,16 @@ def cmd_search(prof, args):
 
     method = "search.files" if opts.get("--files") else "search.messages"
     key = "files" if opts.get("--files") else "messages"
-    want = None if opts.get("--all") else int(opts.get("--limit", 20))
+    want = None if opts.get("--all") else opt_int(opts, "--limit", 20)
     params = {"query": q, "sort": opts.get("--sort", "score"),
               "sort_dir": "asc" if opts.get("--asc") else "desc", "highlight": False}
 
     prof.banner()
     matches, page, total, pages = [], 1, None, 1
     while True:
-        params["count"] = min(100, want - len(matches)) if want else 100
+        # count は 100 で固定する。Slack のオフセットは (page-1)*count なので、
+        # 最終ページだけ count を縮めるとオフセットが後ろに戻り、既出の行をもう一度返す
+        params["count"] = 100
         params["page"] = page
         res = prof.call(method, params)
         block = res.get(key) or {}
@@ -866,6 +932,8 @@ def cmd_search(prof, args):
             matches = matches[:want]
             break
         if page >= pages:
+            if total is not None and not want and len(matches) < total:
+                incomplete(f"検索: {total} 件中 {len(matches)} 件しか取れませんでした")
             break
         page += 1
         note(f"{len(matches)} 件 …")
@@ -904,7 +972,7 @@ def cmd_ask(prof, args):
         die('usage: slk ask "<キーワード>" [--in #ch] [--context] [--types messages,channels,files]\n'
             '    文章を丸ごと渡すと 0 件になる（キーワード一致のため）')
     params = {"query": " ".join(rest),
-              "limit": min(20, int(opts.get("--limit", 20))),
+              "limit": min(20, opt_int(opts, "--limit", 20)),
               "content_types": opts.get("--types", "messages"),
               "include_context_messages": bool(opts.get("--context"))}
     if opts.get("--channels"):
@@ -983,7 +1051,7 @@ def cmd_channels(prof, args):
                      "archived": bool(r.get("archived")), "topic": r.get("topic") or ""})
     rows.sort(key=lambda r: r["name"])
     if opts.get("--limit"):
-        rows = rows[:int(opts["--limit"])]
+        rows = rows[:opt_int(opts, "--limit", 0)]
     if not human():
         out_json(rows)
         return
@@ -1017,7 +1085,7 @@ def cmd_users(prof, args):
             rows.append(dict(r, id=uid))
         rows.sort(key=lambda r: r["name"])
     if opts.get("--limit"):
-        rows = rows[:int(opts["--limit"])]
+        rows = rows[:opt_int(opts, "--limit", 0)]
     if not human():
         out_json(rows)
         return
@@ -1047,7 +1115,7 @@ def cmd_history(prof, args):
     if not rest:
         die("usage: slk history <#channel|@user> [--limit N] [--after YYYY-MM-DD] [--before ...]")
     cid = prof.resolve_channel(rest[0])
-    limit = int(opts.get("--limit", 50))
+    limit = opt_int(opts, "--limit", 50)
     params = {"channel": cid, "limit": min(1000, limit)}
     if opts.get("--after"):
         params["oldest"] = to_epoch(opts["--after"])
@@ -1058,16 +1126,26 @@ def cmd_history(prof, args):
     if G.get("--raw"):
         out_json(res)
         return
-    msgs = drop_system(list(reversed(res.get("messages") or [])))[:limit]
+    # drop_system は API の limit を掛けたあとに効くので、システムメッセージの多い
+    # チャンネルでは要求より少なくなる。取り切れていないなら黙って返さない
+    raw_msgs = res.get("messages") or []
+    msgs = drop_system(list(reversed(raw_msgs)))[:limit]
+    if len(msgs) < limit and res.get("has_more"):
+        incomplete(f"{len(msgs)} 件しか取れませんでした（続きがあります）")
     name = prof.display_channel(cid)
     if G.get("--json"):
+        if opts.get("--threads"):
+            warn("--threads は --json では効きません（本文のみ出力します）")
         out_json([msg_dict(prof, m, cid, name) for m in msgs])
         return
     note(f"{name}: {len(msgs)} 件（古い順）")
     for m in msgs:
         print_message(prof, m, channel=None, link=prof.permalink(cid, m.get("ts")))
         if opts.get("--threads") and m.get("reply_count"):
-            for r in prof.call("conversations.replies", {"channel": cid, "ts": m["ts"], "limit": 100})["messages"][1:]:
+            _r = prof.call("conversations.replies", {"channel": cid, "ts": m["ts"], "limit": 100})
+            if _r.get("has_more"):
+                incomplete("スレッドの一部が 100 件を超えています")
+            for r in (_r.get("messages") or [])[1:]:
                 print_message(prof, r, channel=None, indent="    ")
 
 
@@ -1093,6 +1171,8 @@ def cmd_thread(prof, args):
         cid, ts = prof.resolve_channel(args[0]), args[1]
     prof.banner()
     res = prof.call("conversations.replies", {"channel": cid, "ts": ts, "limit": 200})
+    if res.get("has_more") or (res.get("response_metadata") or {}).get("next_cursor"):
+        incomplete("スレッドが 200 件を超えています。表示は先頭 200 件までです")
     if G.get("--raw"):
         out_json(res)
         return
@@ -1115,7 +1195,7 @@ def cmd_read(prof, args):
     if not parsed:
         die("Slack のメッセージ URL ではありません（…/archives/C…/p… の形）")
     cid, ts, thread_ts = parsed
-    n = int(opts.get("--context", 0))
+    n = opt_int(opts, "--context", 0, minimum=0)
     prof.banner()
     res = prof.call("conversations.history",
                     {"channel": cid, "latest": ts, "oldest": ts, "inclusive": True, "limit": 1})
@@ -1141,7 +1221,10 @@ def cmd_read(prof, args):
         print_message(prof, m, indent="  ")
     if target.get("reply_count") or thread_ts:
         root = thread_ts or target.get("thread_ts") or ts
-        replies = prof.call("conversations.replies", {"channel": cid, "ts": root, "limit": 200})["messages"]
+        _rep = prof.call("conversations.replies", {"channel": cid, "ts": root, "limit": 200})
+        if _rep.get("has_more") or (_rep.get("response_metadata") or {}).get("next_cursor"):
+            incomplete("スレッドが 200 件を超えています。表示は先頭 200 件までです")
+        replies = _rep.get("messages") or []
         note(f"スレッド {len(replies)} 件")
         for r in replies[1:]:
             print_message(prof, r, indent="    ")
@@ -1152,7 +1235,8 @@ def cmd_cache(prof, args):
     if sub == "clear":
         path = os.path.join(prof.dir, "cache")
         for f in os.listdir(path) if os.path.isdir(path) else []:
-            os.remove(os.path.join(path, f))
+            target = os.path.join(path, f)
+            shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
         print(f"{prof.name}: キャッシュを削除しました")
     elif sub == "refresh":
         u = prof.user_index(refresh=True)
@@ -1191,12 +1275,17 @@ def cmd_api(prof, args):
         out_json(prof.call(method, params))
         return
     key = opts.get("--key")
+    probe = prof.call(method, dict(params, limit=params.get("limit", 200)))
     if not key:
-        probe = prof.call(method, dict(params, limit=params.get("limit", 200)))
-        key = next((k for k, v in probe.items() if isinstance(v, list)), None)
-        if not key:
+        cands = [k for k, v in probe.items() if isinstance(v, list)]
+        if len(cands) > 1:
+            die(f"どの配列を辿るか決められません（{'/'.join(cands)}）。--key で指定してください")
+        if not cands:
             out_json(probe)
             return
+        key = cands[0]
+    elif not isinstance(probe.get(key), list):
+        die(f"--key {key} は配列ではありません（{'/'.join(probe)}）")
     rows = paginate(prof, method, dict(params, limit=params.get("limit", 200)), key)
     out_json({key: rows, "count": len(rows)})
 
@@ -1283,8 +1372,8 @@ def oauth_exchange(app, secret, code):
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("User-Agent", USER_AGENT)
     try:
-        with urllib.request.build_opener(_NoRedirect).open(req) as res:
-            blob = json.loads(res.read().decode())
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=60) as res:
+            blob = as_json(res.read())
     except urllib.error.HTTPError as e:
         die(f"oauth.v2.access -> HTTP {e.code} {e.read().decode()[:300]}")
     if not blob.get("ok"):
@@ -1296,13 +1385,25 @@ def oauth_exchange(app, secret, code):
 
 
 class _Catcher(http.server.BaseHTTPRequestHandler):
-    """着地ページの JS から投げ返される 1 リクエストだけを拾う。"""
+    """着地ページの JS から投げ返される 1 リクエストだけを拾う。
+
+    **state が一致しないリクエストは捨てる。** 待ち受けはローカルの誰でも叩けるので、
+    これが無いと他人の認可コードを流し込んで、client_secret を持つこちら側に交換させ、
+    攻撃者のワークスペースのトークンを掴ませられる（`error=` だけ投げれば妨害もできる）。
+    貼り付け経路の warn は「人間が code だけを貼った」場合のためのもので、
+    そこを緩めたままここに適用してはいけない。
+    """
     result = None
+    expect_state = None
 
     def do_GET(self):
         q = {k: v[0] for k, v in
              urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).items()}
         if "code" not in q and "error" not in q:
+            self.send_response(404)
+            self.end_headers()
+            return
+        if not _Catcher.expect_state or q.get("state") != _Catcher.expect_state:
             self.send_response(404)
             self.end_headers()
             return
@@ -1320,8 +1421,9 @@ class _Catcher(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def serve_once(srv, timeout):
+def serve_once(srv, timeout, state):
     _Catcher.result = None
+    _Catcher.expect_state = state
     srv.timeout = 1
     deadline = time.time() + timeout
     while time.time() < deadline and _Catcher.result is None:
@@ -1353,9 +1455,11 @@ def install_token(name, token, auth, quiet=False):
             print(f"トークンは Keychain に保存しました（service={KEYCHAIN_SERVICE} / account={name}）")
     else:
         env_path = os.path.join(dir_, "env")
-        with open(env_path, "w") as f:
+        # open してから chmod すると、その間は umask の権限で読める。ここに置くのは
+        # 平文のユーザートークンなので、作成時の mode で 0600 を確定させる
+        fd = os.open(env_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(f"SLACK_USER_TOKEN={token}\n")
-        os.chmod(env_path, 0o600)
         warn(f"Keychain に保存できなかったので {env_path} に平文で置きました: {err}")
     blob = save_team(dir_, auth)
     with open(os.path.join(dir_, ".label"), "w") as f:
@@ -1404,7 +1508,7 @@ def cmd_login(args):
 
     got = None
     if srv:
-        got = serve_once(srv, int(opts.get("--timeout", 300)))
+        got = serve_once(srv, opt_int(opts, "--timeout", 300), state)
         if got is None:
             warn("ブラウザから自動で受け取れませんでした。貼り付けに切り替えます")
     if got is None:
@@ -1671,6 +1775,8 @@ def cmd_profile(args):
         if not os.path.isdir(dir_):
             die(f"プロファイル '{name}' がありません")
         if not (opts.get("-f") or opts.get("--yes")):
+            if not sys.stdin.isatty():
+                die("対話環境ではないので確認できません（--yes を付けてください）")
             ans = input(f"{dir_} とトークンを削除します。よろしいですか? [y/N] ").strip().lower()
             if ans not in ("y", "yes"):
                 die("中止しました")
@@ -1694,16 +1800,19 @@ def cmd_profile(args):
 USAGE = """usage: slk [--profile <name>] [--json|--raw] [--quiet] <command>
 
   slk manifest [--search both|legacy|rts]   アプリ作成用の manifest を出す
-  slk login [<profile 名>] [--manual] [--reset-secret]
+  slk login [<profile 名>] [--manual] [--reset-secret] [--timeout N]
                                             ブラウザで承認して自分のトークンを取る
   slk profile [list|current|use|add|keychain [--force]|rename|label|path|rm]
   slk whoami                                トークンの持ち主とワークスペース
 
   slk search "<query>" [--in #ch] [--from @user] [--after 2026-09-01] [--before ...]
-                       [--limit N|--all] [--sort score|timestamp] [--asc] [--files]
-  slk ask "<キーワード>" [--in #ch] [--context] [--types messages,channels,files] [--limit N]
+                       [--on YYYY-MM-DD] [--limit N|--all] [--sort score|timestamp]
+                       [--asc] [--files]
+  slk ask "<キーワード>" [--in #ch] [--channels #a,#b] [--context]
+                       [--types messages,channels,files] [--limit N]   ※ --limit は最大 20
   slk channels [pattern] [--private|--public|--dm] [--member] [--archived] [--refresh]
-  slk users [pattern] [--email a@b] [--bots] [--deleted] [--refresh]
+                       [--limit N]
+  slk users [pattern] [--email a@b] [--bots] [--deleted] [--refresh] [--limit N]
   slk members <#channel>
   slk history <#channel|@user> [--limit N] [--after ...] [--before ...] [--threads]
   slk thread <permalink | #channel ts>
@@ -1711,9 +1820,12 @@ USAGE = """usage: slk [--profile <name>] [--json|--raw] [--quiet] <command>
   slk file <F…|permalink|URL> [-o <先>|-] [--force] [--info]
                                             添付ファイルを落とす（中身の解釈はしない）
   slk cache [refresh|clear]
-  slk api <method> [k=v ...] [--all]        allowlist 内の読み取りメソッドだけ
+  slk api <method> [k=v ...] [--all] [--key <配列のキー>]
+                                            allowlist 内の読み取りメソッドだけ
+  slk profile rm <名前> [-f|--yes]
 
-ワークスペースの選択は --profile > SLK_PROFILE > slk profile use の順。
+ワークスペースの選択は --profile > SLK_PROFILE > slk profile use の順（SLK_TOKEN があればそれが最優先）。
+--all は最後まで辿れなかったら exit 1 になる（出力は途中まで）。
 search は Slack の検索構文をそのまま渡せる（--in / --from / --after は連結するだけの糖衣）。
 ask は前後の文脈ごと取れるが、文章ではなく単語で渡すこと（キーワード一致で、文章は 0 件になる）。"""
 
@@ -1740,6 +1852,8 @@ def main():
     if cmd not in table:
         die(f"未知のコマンド: {cmd}\n\n{USAGE}")
     table[cmd](prof, args)
+    if _incomplete:
+        die(f"取り切れませんでした（{_incomplete}）。出力は途中までです")
 
 
 def split_global(argv):
