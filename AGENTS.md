@@ -120,7 +120,11 @@ gws について:
 - Keychain の項目は `(service, account)` だけが鍵で、`SLK_CONFIG_DIR` は鍵に入らない。
   試験用の設定ディレクトリを作るときは `SLK_KEYCHAIN_SERVICE` も一緒に変えないと、
   本物のトークンを引く
-- `gws` の Keychain も同じで、鍵は (service=`gws-cli`, account) だけ。config dir は鍵に
-  入らないので、`credentials.enc` はプロファイルごとでも**復号鍵は 1 つ**。プロファイルは
-  利便性の境界であってセキュリティ境界ではない。`gws auth logout` がその鍵を消す／回すと
-  他のプロファイルも巻き添えになりうる（未検証。試すならスクラッチのプロファイルで）
+- `gws` の Keychain も同じで、鍵は (service=`gws-cli`, account=**OS のユーザー名**) だけ。
+  config dir は鍵に入らないので、`credentials.enc` はプロファイルごとでも**復号鍵は 1 つ**。
+  プロファイルは利便性の境界であってセキュリティ境界ではない
+  （バイナリへの ACL 許可 1 回で全プロファイルが復号できる）。
+  なお `gws auth logout` は config dir のファイルを消すだけで**鍵には触れない**ので、
+  他のプロファイルは巻き添えにならない（2026-09-15 に実測。ダミーの `credentials.enc` を
+  置いた一時ディレクトリに対して実行し、応答の `removed` がそのファイルだけを挙げること、
+  項目の `mdat` が動かないこと、他プロファイルが復号できることを確認した）

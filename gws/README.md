@@ -30,7 +30,9 @@ GWS_PROFILE=<name> gws ...      その 1 コマンドだけ別プロファイル
   プロファイルは元の `cache` を symlink で共有する。`rename` / `rm` はその張り替えまで面倒を見る
 - プロファイルは**利便性の境界であってセキュリティ境界ではない**。`credentials.enc` は
   プロファイルごとに分かれるが、復号鍵は Keychain の 1 項目で共有される
-  （鍵は service と account だけで、config dir は入らない）。このため
-  `gws auth logout` は他のプロファイルまで巻き添えにしうる
+  （鍵は service と account だけで、config dir は入らない）。バイナリに一度アクセスを
+  許可すれば、どのプロファイルの認証情報も復号できる。
+  `gws auth logout` は当該 config dir のファイルを消すだけで鍵には触らないので、
+  他のプロファイルは巻き添えにならない
 - `GOOGLE_WORKSPACE_CLI_{TOKEN,CREDENTIALS_FILE,CLIENT_ID,CLIENT_SECRET}` が設定されていると
   プロファイルより優先されるため、ラッパー側で解除して警告する
