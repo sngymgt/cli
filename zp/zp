@@ -117,7 +117,11 @@ _api_base = None
 def zoom_host(url):
     """資格情報を送ってよいのは zoom.us 配下だけ。トークンのレスポンスが返した値でも、
     ホストを確かめずに使うと、応答を差し替えられたときに送り先ごと乗っ取られる。"""
-    scheme, netloc = urllib.parse.urlsplit(url)[:2]
+    try:
+        scheme, netloc = urllib.parse.urlsplit(url)[:2]
+    except ValueError:
+        # urlsplit は [foo] のような壊れた netloc で例外を投げる。可否だけ返す
+        return False
     host = netloc.split("@")[-1].split(":")[0].lower()
     return scheme == "https" and (host == "zoom.us" or host.endswith(".zoom.us"))
 
@@ -136,14 +140,18 @@ def access_token(env, verbose=False):
     req.add_header("Authorization", f"Basic {basic}")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("User-Agent", USER_AGENT)
+    # 既定の opener は転送を追い、Authorization を転送先へ持ち回る。ここで運ぶのは
+    # 1 時間で切れるトークンではなく client_secret なので、追わずに 3xx で止める
+    opener = urllib.request.build_opener(_NoRedirect)
     try:
-        with urllib.request.urlopen(req, timeout=30) as res:
-            payload = json.loads(res.read().decode())
+        with opener.open(req, timeout=30) as res:
+            payload = as_json(res.read())
     except urllib.error.HTTPError as e:
-        die(f"トークン取得に失敗しました: HTTP {e.code} {e.read().decode()[:500]}")
+        die(f"トークン取得に失敗しました: HTTP {e.code} "
+            f"{e.read().decode(errors='replace')[:500]}")
     except urllib.error.URLError as e:
         die(f"Zoom に接続できません: {e.reason}")
-    if "access_token" not in payload:
+    if not isinstance(payload, dict) or "access_token" not in payload:
         die(f"access_token が返りませんでした: {json.dumps(payload, ensure_ascii=False)}")
     _token = payload["access_token"]
     returned = (payload.get("api_url") or "").rstrip("/")
@@ -241,7 +249,7 @@ def out(obj):
 def check(status, body, path):
     if status != 200:
         code = body.get("code") if isinstance(body, dict) else None
-        msg = body.get("message") if isinstance(body, dict) else str(body)[:300]
+        msg = (body.get("message") if isinstance(body, dict) else None) or str(body)[:300]
         die(f"{path} -> HTTP {status}" + (f" code={code}" if code else "") + f" {msg}")
     return body
 
@@ -264,13 +272,25 @@ def paged(env, path, params, fetch_all):
         return body
     key = list_key(body)
     if key is None:
+        if body.get("next_page_token"):
+            note("配列のキーが見つからないので 1 ページ目だけ返します (--all が効いていません)")
         return body
     items = list(body[key])
     token = body.get("next_page_token")
+    seen = set()
     while token:
+        # 同じトークンを返し続けるエンドポイントがあると終端条件が来ない。件数では
+        # 止まらないので、トークンそのものの再出現で打ち切る
+        if token in seen:
+            note(f"next_page_token が繰り返されたので {len(items)} 件で打ち切りました")
+            break
+        seen.add(token)
         params["next_page_token"] = token
         status, page = call(env, path, params)
         check(status, page, path)
+        # 200 でも JSON とは限らない (メンテナンス HTML 等)。as_json は str を返す
+        if not isinstance(page, dict):
+            die(f"{path} -> 2 ページ目以降が JSON ではありません: {str(page)[:200]}")
         items += page.get(key, [])
         token = page.get("next_page_token")
     body[key] = items
@@ -315,10 +335,13 @@ def default_range():
 
 def with_range(params):
     """from / to は省略されがちだが、無いと既定の幅が何かを Zoom が明言していない。
-    こちらで直近 7 日を入れて、いつの分を見ているかを曖昧にしない。"""
-    frm, to = default_range()
-    params.setdefault("from", frm)
-    params.setdefault("to", to)
+    こちらで直近 7 日を入れて、いつの分を見ているかを曖昧にしない。
+
+    片方だけ指定されたときに残りを補わないのは、ユーザーが書いていない側で 1 回の幅の
+    上限を超え、書いた覚えのないパラメータで 400 になるため。"""
+    if "from" in params or "to" in params:
+        return params
+    params["from"], params["to"] = default_range()
     return params
 
 
@@ -368,6 +391,8 @@ def cmd_probe(env, args):
         print("\nアカウント単位で録音が取れないので、ユーザー単位を試します")
         status, body = call(env, "phone/users", {"page_size": 100})
         for u in (body.get("users", []) if isinstance(body, dict) else []):
+            if not isinstance(u, dict) or not u.get("id"):
+                continue
             st, b = call(env, f"phone/users/{u['id']}/recordings",
                          {"from": frm, "to": to, "page_size": 30})
             n = len(b.get("recordings", [])) if isinstance(b, dict) and st == 200 else 0
@@ -429,7 +454,9 @@ def cmd_download(env, args):
     # URL を渡された場合はそのまま使う (ホストは api_url が確かめる)
     target = rest[0]
     path = target if "://" in target else f"phone/recording/download/{target}"
-    rid = target.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+    rid = target.rstrip("/").rsplit("/", 1)[-1].split("?")[0].split("#")[0]
+    if not rid:
+        die(f"保存名を決められません: {target}")
     dest = opts.get("-o") or opts.get("--output")
 
     if dest == "-":
@@ -465,13 +492,14 @@ def cmd_download(env, args):
             # 存在確認と書き込みを分けると、その隙に作られたファイルを潰す。
             # O_EXCL で名前の確保そのものを不可分にする
             try:
-                fh = open(dest, "xb")
+                # 録音音声は env と同じ機微なので --force 経路 (mkstemp は 0600) と
+                # 権限を揃える。open("xb") のままだと umask 次第で他人に読める
+                fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
                 die(f"既にあります: {dest} (上書きするなら --force)")
             try:
-                with fh as f:
+                with os.fdopen(fd, "wb") as f:
                     shutil.copyfileobj(res, f)
-                    f.truncate()
             except BaseException:
                 if os.path.exists(dest):
                     os.unlink(dest)
@@ -514,8 +542,9 @@ USAGE = """usage:
   zp recordings [k=v ...] [--all]        録音一覧 (from/to 省略時は直近 7 日)
   zp history [k=v ...] [--all]           通話履歴 (phone/call_history)
   zp transcript <recordingId>            文字起こしを返ってきたまま表示
-  zp download <download_url|id> [-o <先>|-] [--force]   録音の音声を保存
-                                         （一覧が返す download_url をそのまま渡す）
+  zp download <download_url> [-o <先>|-] [--force]      録音の音声を保存
+                                         （一覧が返す download_url をそのまま渡す。
+                                           録音の id からは組み立てられない）
   zp get <path> [k=v ...] [--all]        任意の GET
 
 path は v2 が補われる (例: `zp get phone/users/<userId>/recordings from=2026-09-01`)。
@@ -552,6 +581,13 @@ def main():
         die(f"未知のコマンド: {cmd}\n\n{USAGE}")
     try:
         fn(load_env(), args)
+    except urllib.error.HTTPError as e:
+        # download は call() を通さず fetch() を直に使うので、ここまで包まれない
+        body = as_json(e.read())
+        msg = (body.get("message") if isinstance(body, dict) else None) or str(body)[:300]
+        die(f"HTTP {e.code} {msg or e.reason}")
+    except KeyboardInterrupt:
+        die("中断しました")
     except BrokenPipeError:
         os._exit(0)
 

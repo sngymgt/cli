@@ -38,6 +38,9 @@ git 履歴は force-push しても GitHub 上に SHA で残る。入れてしま
   そのサービスのオリジンと突き合わせてから使う。**リダイレクトも追わない**
   （urllib は転送先が別ホストでも Authorization を持ち回るので、入口だけ確認しても漏れる）。
   実装例は `tldv` と `zoho` の `api_url()` / `_NoRedirect`
+- **トークンを取りに行く要求も `urlopen` で投げない。** 本文に入れた `client_secret` は
+  302 で POST→GET になって落ちるが、`Authorization` ヘッダは転送先まで付いて行く。
+  ヘッダに資格情報を載せるなら `_NoRedirect` を挿した opener を使う（`mf` と `zp`）
 
 slk について:
 
