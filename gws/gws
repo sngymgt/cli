@@ -3,6 +3,10 @@
 # A profile is just a gws config dir; GOOGLE_WORKSPACE_CLI_CONFIG_DIR selects it.
 set -euo pipefail
 
+# プロファイル配下には認証情報が入る。mkdir/cp のたびに chmod して回ると必ず窓が残るので、
+# 本体が作るファイルごと umask で閉じる（exec 先にも引き継がれる）
+umask 077
+
 PROFILE_ROOT="${GWS_PROFILE_ROOT:-$HOME/.config/gws-profiles}"
 ACTIVE_FILE="$PROFILE_ROOT/active"
 LEGACY_CONFIG="$HOME/.config/gws"
@@ -13,7 +17,15 @@ IFS=':' read -r -a _path_parts <<< "$PATH"
 for _d in "${_path_parts[@]}"; do
   [ -n "$_d" ] || continue
   [ -x "$_d/gws" ] || continue
+  # 実体（デバイス:inode）で比較する。パス文字列だと、同じ wrapper への symlink が
+  # PATH に 2 つあるだけで互いを「別のプログラム」と見なし、exec が往復して止まらない
   _cand="$(cd "$_d" && pwd -P)/gws"
+  _id_a="$(stat -f '%d:%i' "$_d/gws" 2>/dev/null || true)"
+  _id_b="$(stat -f '%d:%i' "$self_path" 2>/dev/null || true)"
+  if [ -n "$_id_a" ] && [ "$_id_a" = "$_id_b" ]; then
+    continue
+  fi
+  # stat が使えない環境ではパス比較に戻す（自分を実体と誤認する方が危ない）
   [ "$_cand" = "$self_path" ] && continue
   real_gws="$_d/gws"
   break
@@ -74,15 +86,26 @@ authed() {
   [ -f "$1/credentials.enc" ] || [ -f "$1/credentials.json" ]
 }
 
+# sed の .* は貪欲なので、1 行に複数の emailAddress があると最後のものを拾う
+# （owners[] が入ると本人ではなく他人のアドレスになる）。最初の 1 つだけを取る。
+# 末尾の `|| true` は必須: pipefail が有効なので、grep の不一致と head による
+# SIGPIPE がそのまま呼び出し側の set -e に伝わって落ちる
+first_email() {
+  printf '%s' "$1" \
+    | grep -o '"emailAddress"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -n1 \
+    | sed 's/.*"\([^"]*\)"$/\1/' || true
+}
+
 # Resolves the signed-in address. Drive's about.get carries it under any drive
 # scope, which is the scope people actually grant; gmail is the fallback.
 resolve_label() {
   local dir="$1" out email
   out="$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$dir" "$real_gws" drive about get --params '{"fields":"user"}' 2>/dev/null || true)"
-  email="$(printf '%s' "$out" | sed -n 's/.*"emailAddress"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  email="$(first_email "$out")"
   if [ -z "$email" ]; then
     out="$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$dir" "$real_gws" gmail users getProfile --params '{"userId":"me"}' 2>/dev/null || true)"
-    email="$(printf '%s' "$out" | sed -n 's/.*"emailAddress"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    email="$(first_email "$out")"
   fi
   [ -n "$email" ] || return 1
   printf '%s\n' "$email"
@@ -105,6 +128,10 @@ gws profile — gws の認証情報プロファイルを切り替える
 
   GWS_PROFILE=<name> gws ...      その1コマンドだけ別プロファイルで実行
   GWS_PROFILE_ROOT=<dir>          プロファイル置き場（既定 ~/.config/gws-profiles）
+  GWS_PROFILE_PASSTHROUGH=1       profile も本体に渡す（本体側の profile を使うとき）
+
+GOOGLE_WORKSPACE_CLI_{TOKEN,CREDENTIALS_FILE,CLIENT_ID,CLIENT_SECRET} は
+プロファイルより優先されてしまうため、設定されていれば解除して警告する。
 
 profile 以外の引数はすべて googleworkspace-cli にそのまま渡される。
 USAGE
@@ -124,7 +151,7 @@ cmd_profile() {
         dir="$(profile_dir "$name")" || continue
         mark="  "; [ "$name" = "$active" ] && mark="* "
         label=""
-        [ -s "$dir/.label" ] && label="$(head -n1 "$dir/.label")"
+        [ -s "$dir/.label" ] && label="$(head -n1 "$dir/.label" | tr -d '\000-\037')"
         if ! authed "$dir"; then
           label="${label:+$label }(未認証)"
         fi
@@ -142,14 +169,20 @@ cmd_profile() {
       [ -d "$(profile_dir "$name")" ] || die "プロファイル '$name' がありません"
       printf '%s\n' "$name" > "$ACTIVE_FILE"
       echo "有効なプロファイル: $name"
-      [ -n "${GWS_PROFILE:-}" ] && echo "注意: 環境変数 GWS_PROFILE=$GWS_PROFILE が設定されているため、この設定より優先されます" >&2
+      # `[ … ] && echo` で分岐を終えない。条件が偽のとき（＝環境変数が無い通常ケース）
+      # その 1 が cmd_profile の戻り値になり、set -e が成功時に exit 1 させる
+      if [ -n "${GWS_PROFILE:-}" ]; then
+        echo "注意: 環境変数 GWS_PROFILE=$GWS_PROFILE が設定されているため、この設定より優先されます" >&2
+      fi
       ;;
 
     add)
       local name="" client="" no_login=0 login_args=()
       while [ $# -gt 0 ]; do
         case "$1" in
-          --client) client="${2:-}"; shift 2 ;;
+          --client)
+            [ $# -ge 2 ] || die "--client にパスがありません"
+            client="$2"; shift 2 ;;
           --no-login) no_login=1; shift ;;
           --) shift; login_args=("$@"); break ;;
           -*) die "不明なオプション: $1" ;;
@@ -246,7 +279,9 @@ cmd_profile() {
         echo "  有効なプロファイル名も '$new' に更新しました"
       fi
       echo "'$old' を '$new' に改名しました"
-      [ -L "$new_dir" ] && echo "（実体は $(readlink "$new_dir") のまま。移動していません）"
+      if [ -L "$new_dir" ]; then
+        echo "（実体は $(readlink "$new_dir") のまま。移動していません）"
+      fi
       ;;
 
     path)
@@ -265,7 +300,12 @@ cmd_profile() {
         esac
       done
       require_name "$name"
-      [ "$name" = "$(current_profile)" ] && die "有効なプロファイルは削除できません（先に gws profile use で切り替える）"
+      # ガードは ACTIVE_FILE を直接見る。current_profile は GWS_PROFILE を優先して
+      # 返すので、環境変数を立てたまま叩くと active に書かれている方を消せてしまう
+      # （rename は ACTIVE_FILE を見ており、こちらと食い違っていた）
+      local active_now=""
+      [ -f "$ACTIVE_FILE" ] && active_now="$(cat "$ACTIVE_FILE")"
+      [ "$name" = "$active_now" ] && die "有効なプロファイルは削除できません（先に gws profile use で切り替える）"
       local dir; dir="$(profile_dir "$name")"
       [ -e "$dir" ] || die "プロファイル '$name' がありません"
       if [ "$force" -ne 1 ]; then
@@ -351,5 +391,16 @@ if [ ! -d "$config_dir" ]; then
   echo "gws: プロファイル '$profile' がありません（gws profile list）" >&2
   exit 1
 fi
+# 本体は CONFIG_DIR 以外の経路でも資格情報を受け取る（TOKEN は本体ヘルプいわく「最優先」）。
+# 残っていると profile current が work と言いながら別 ID で叩くので、ここで落とす。
+# このずれを防ぐことがこの wrapper の存在理由なので、素通しにはしない
+for _v in GOOGLE_WORKSPACE_CLI_TOKEN GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE \
+          GOOGLE_WORKSPACE_CLI_CLIENT_ID GOOGLE_WORKSPACE_CLI_CLIENT_SECRET; do
+  if [ -n "${!_v:-}" ]; then
+    echo "gws: $_v が設定されているので解除しました（プロファイルより優先されるため）" >&2
+    unset "$_v"
+  fi
+done
+
 export GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir"
 exec "$real_gws" "$@"
