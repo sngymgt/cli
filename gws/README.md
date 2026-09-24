@@ -4,13 +4,14 @@
 本体に無い**認証プロファイルの切り替え**だけを足している。
 
 プロファイルの実体は gws の設定ディレクトリで、`GOOGLE_WORKSPACE_CLI_CONFIG_DIR` で選ぶ。
-`profile` 以外の引数はすべて本体にそのまま渡す。
+`profile` と `--profile` 以外の引数はすべて本体にそのまま渡す。
 
 ```
 gws profile                     一覧（* が有効）
 gws profile use <name>          切り替え
 gws profile add <name>          作ってログイン
-GWS_PROFILE=<name> gws ...      その 1 コマンドだけ別プロファイルで
+gws --profile <name> ...        その 1 コマンドだけ別プロファイルで（位置は問わない）
+GWS_PROFILE=<name> gws ...      同上
 ```
 
 詳しくは `gws profile help`。

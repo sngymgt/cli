@@ -126,14 +126,15 @@ gws profile — gws の認証情報プロファイルを切り替える
   gws profile path [name]         設定ディレクトリのパス
   gws profile rm <name> [-f]      プロファイルを削除
 
-  GWS_PROFILE=<name> gws ...      その1コマンドだけ別プロファイルで実行
+  gws --profile <name> ...        その1コマンドだけ別プロファイルで実行（位置は問わない）
+  GWS_PROFILE=<name> gws ...      同上（--profile があればそちらが優先）
   GWS_PROFILE_ROOT=<dir>          プロファイル置き場（既定 ~/.config/gws-profiles）
   GWS_PROFILE_PASSTHROUGH=1       profile も本体に渡す（本体側の profile を使うとき）
 
 GOOGLE_WORKSPACE_CLI_{TOKEN,CREDENTIALS_FILE,CLIENT_ID,CLIENT_SECRET} は
 プロファイルより優先されてしまうため、設定されていれば解除して警告する。
 
-profile 以外の引数はすべて googleworkspace-cli にそのまま渡される。
+profile と --profile 以外の引数はすべて googleworkspace-cli にそのまま渡される。
 USAGE
 }
 
@@ -373,6 +374,27 @@ cmd_profile() {
       ;;
   esac
 }
+
+# --profile <name> / --profile=<name> は GWS_PROFILE と同じ意味で、位置はどこでもよい。
+# 本体には渡さない。`--` 以降（profile add の auth login 引数）は触らない
+if [ -z "${GWS_PROFILE_PASSTHROUGH:-}" ]; then
+  _args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) _args+=("$@"); break ;;
+      --profile)
+        [ $# -ge 2 ] || die "--profile にプロファイル名がありません"
+        GWS_PROFILE="$2"; shift 2 ;;
+      --profile=*) GWS_PROFILE="${1#--profile=}"; shift ;;
+      *) _args+=("$1"); shift ;;
+    esac
+  done
+  set -- ${_args[@]+"${_args[@]}"}
+  # 空だと current_profile が黙って active に落ちる。指定したのに別 ID で叩くのが一番まずい
+  if [ -n "${GWS_PROFILE+x}" ] && [ -z "$GWS_PROFILE" ]; then
+    die "--profile にプロファイル名がありません"
+  fi
+fi
 
 if [ "${1:-}" = "profile" ] && [ -z "${GWS_PROFILE_PASSTHROUGH:-}" ]; then
   shift
