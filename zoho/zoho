@@ -414,6 +414,13 @@ def multipart(name, filename, data):
     return body, f"multipart/form-data; boundary={boundary}"
 
 
+def same_code(a, b):
+    """保存時に Zoho が末尾の改行を落とすので、そこだけ揃えて比べる。
+    揃えないと、エディタが末尾に改行を足したファイルを push したとき、公開まで
+    済んでいるのに読み直しで失敗し、しかも行単位の差分には何も出ない。"""
+    return a.rstrip(b"\r\n") == b.rstrip(b"\r\n")
+
+
 def cmd_fn_push(env, args):
     """Deluge 関数のコードを差し替え、読み直して送った内容と一致するか確かめる。
 
@@ -439,7 +446,7 @@ def cmd_fn_push(env, args):
     filename, current = fetch_code(env, ident)
     if not filename.endswith(".ds"):
         die(f"{ident} は Deluge の関数ではありません（{filename}）。push は Deluge だけです")
-    if base is not None and current != base:
+    if base is not None and not same_code(current, base):
         die(f"{ident} の今のコードが --base と違います。画面で直された可能性があるので、"
             "取り直してから直してください")
     body, ctype = multipart("code", filename, code)
@@ -451,13 +458,13 @@ def cmd_fn_push(env, args):
         die(f"PUT {url} -> 更新できませんでした: {json.dumps(res, ensure_ascii=False)[:1000]}")
     # Zoho は書けていなくても SUCCESS を返すことがあるので、応答ではなく読み直しで判定する
     _, after = fetch_code(env, ident)
-    if after != code:
+    if not same_code(after, code):
         diff = difflib.unified_diff(
             code.decode().splitlines(), after.decode(errors="replace").splitlines(),
             "送った内容", "読み直した内容", lineterm="")
         print("\n".join(list(diff)[:60]), file=sys.stderr)
         die(f"{ident} を読み直した内容が送った内容と違います")
-    note = "（内容は変わっていません）" if current == code else ""
+    note = "（内容は変わっていません）" if same_code(current, code) else ""
     print(f"ok: {ident} を更新しました{note}")
 
 
