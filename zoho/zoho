@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Zoho CRM API v8 CLI (OAuth 2.0 self client)."""
 
+import difflib
 import json
 import os
 import stat
@@ -9,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 CONFIG_DIR = os.path.expanduser("~/.config/zoho")
 ENV_PATH = os.path.join(CONFIG_DIR, "env")
@@ -192,17 +194,17 @@ def api_url(env, tokens, path):
     return f"{base}/{path}"
 
 
-def call(env, method, path, params=None, body=None, _retried=False):
+def send(env, method, path, params=None, data=None, content_type=None, _retried=False):
+    """アクセストークンを付けて送り、(url, 応答ヘッダ, 本文のバイト列) を返す。"""
     global _last_call
     tokens = access_token(env)
     url = api_url(env, tokens, path)
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-    data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"Zoho-oauthtoken {tokens['access_token']}")
-    if data:
-        req.add_header("Content-Type", "application/json")
+    if content_type:
+        req.add_header("Content-Type", content_type)
     wait = MIN_INTERVAL - (time.time() - _last_call)
     if wait > 0:
         time.sleep(wait)
@@ -210,13 +212,7 @@ def call(env, method, path, params=None, body=None, _retried=False):
     opener = urllib.request.build_opener(_NoRedirect)
     try:
         with opener.open(req, timeout=120) as res:
-            raw = res.read().decode(errors="replace")
-            if not raw.strip():
-                return {}
-            try:
-                return json.loads(raw)
-            except ValueError:
-                die(f"{method} {url} -> JSON が返りませんでした: {raw[:300]}")
+            return url, res.headers, res.read()
     except urllib.error.HTTPError as e:
         # HTTPError は URLError の派生。この順序を入れ替えると 3xx と 401 の処理が死ぬ
         raw = e.read().decode(errors="replace")
@@ -225,10 +221,30 @@ def call(env, method, path, params=None, body=None, _retried=False):
                 f"（転送先: {e.headers.get('Location')}）")
         if e.code == 401 and not _retried:
             access_token(env, force=True)
-            return call(env, method, path, params, body, _retried=True)
+            return send(env, method, path, params, data, content_type, _retried=True)
         die(f"{method} {url} -> {e.code} {raw[:1000]}")
     except urllib.error.URLError as e:
         die(f"Zoho に接続できません: {e.reason}")
+
+
+def decode_json(method, url, headers, raw):
+    raw = raw.decode(errors="replace")
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except ValueError:
+        if headers.get_filename():
+            die(f"{method} {url} -> ファイル（{headers.get_filename()}）が返りました。"
+                "関数のコードなら `zoho fn pull` で取ってください")
+        die(f"{method} {url} -> JSON が返りませんでした: {raw[:300]}")
+
+
+def call(env, method, path, params=None, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    url, headers, raw = send(env, method, path, params, data,
+                             "application/json" if data else None)
+    return decode_json(method, url, headers, raw)
 
 
 def data_key(res):
@@ -355,6 +371,106 @@ def cmd_coql(env, args):
         incomplete("COQL は 1 回 200 件までです。LIMIT / OFFSET で分けてください")
 
 
+FN_USAGE = ("usage: zoho fn pull <id|api_name>\n"
+            "       zoho fn push <id|api_name> <file.ds> [--base <file.ds>]")
+
+
+def function_path(ident, suffix=""):
+    return f"settings/functions/{urllib.parse.quote(ident, safe='')}{suffix}"
+
+
+def fetch_code(env, ident):
+    """関数のコードを (ファイル名, バイト列) で返す。Deluge は .ds、それ以外は zip。"""
+    url, headers, raw = send(env, "GET", function_path(ident, "/code"))
+    name = headers.get_filename()
+    # 200 でも途中の機器が HTML を差し込むことがある。添付で返らなければコードとして扱わない
+    if not name:
+        die(f"GET {url} -> 関数のコードが返りませんでした: "
+            f"{raw[:300].decode(errors='replace')}")
+    return name, raw
+
+
+def read_deluge(path):
+    try:
+        with open(os.path.expanduser(path), "rb") as f:
+            data = f.read()
+    except OSError as e:
+        die(f"{path} を読めません: {e.strerror}")
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        die(f"{path} が UTF-8 ではありません")
+    if not data.strip():
+        die(f"{path} が空です")
+    return data
+
+
+def multipart(name, filename, data):
+    boundary = uuid.uuid4().hex
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n").encode() \
+        + data + f"\r\n--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def cmd_fn_push(env, args):
+    """Deluge 関数のコードを差し替え、読み直して送った内容と一致するか確かめる。
+
+    Deluge は PUT した時点で公開され、下書きの段階が無い。構文の誤りは
+    COMPILATION_ERROR で拒否されるが、意味の誤りはそのまま本番で動く。
+    引数の宣言もコードの 1 行目から読み直されるので、変えると呼び出し元の
+    ワークフローが渡す引数とずれる。
+
+    --base は、手元で直し始めたときの版。今のコードがそれと違えば送らない。
+    画面のエディタで誰かが直した分を、古い版から作った差分で黙って潰さないため。
+    """
+    base = None
+    if "--base" in args:
+        i = args.index("--base")
+        if i + 1 >= len(args):
+            die(FN_USAGE)
+        base = read_deluge(args[i + 1])
+        args = args[:i] + args[i + 2:]
+    if len(args) != 2:
+        die(FN_USAGE)
+    ident, path = args
+    code = read_deluge(path)
+    filename, current = fetch_code(env, ident)
+    if not filename.endswith(".ds"):
+        die(f"{ident} は Deluge の関数ではありません（{filename}）。push は Deluge だけです")
+    if base is not None and current != base:
+        die(f"{ident} の今のコードが --base と違います。画面で直された可能性があるので、"
+            "取り直してから直してください")
+    body, ctype = multipart("code", filename, code)
+    url, headers, raw = send(env, "PUT", function_path(ident), data=body, content_type=ctype)
+    res = decode_json("PUT", url, headers, raw)
+    rows = res.get("functions") if isinstance(res, dict) else None
+    row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+    if str(row.get("status", "")).lower() != "success":
+        die(f"PUT {url} -> 更新できませんでした: {json.dumps(res, ensure_ascii=False)[:1000]}")
+    # Zoho は書けていなくても SUCCESS を返すことがあるので、応答ではなく読み直しで判定する
+    _, after = fetch_code(env, ident)
+    if after != code:
+        diff = difflib.unified_diff(
+            code.decode().splitlines(), after.decode(errors="replace").splitlines(),
+            "送った内容", "読み直した内容", lineterm="")
+        print("\n".join(list(diff)[:60]), file=sys.stderr)
+        die(f"{ident} を読み直した内容が送った内容と違います")
+    note = "（内容は変わっていません）" if current == code else ""
+    print(f"ok: {ident} を更新しました{note}")
+
+
+def cmd_fn(env, args):
+    if args[:1] == ["pull"] and len(args) == 2:
+        _, code = fetch_code(env, args[1])
+        sys.stdout.buffer.write(code)
+    elif args[:1] == ["push"]:
+        cmd_fn_push(env, args[1:])
+    else:
+        die(FN_USAGE)
+
+
 def cmd_init():
     # CONFIG_DIR を作らないまま open すると、新しいマシンでは README の手順 1 が
     # FileNotFoundError で落ちる
@@ -384,6 +500,10 @@ USAGE = """usage:
   zoho get <path> [k=v ...] [--all]      GET (--all で全ページ取得)
   zoho post|put|patch|delete <path> [@file | - | '<json>']
   zoho coql "<select_query>"             COQL クエリ
+  zoho fn pull <id|api_name>             関数のコードを標準出力へ (Deluge は .ds、他は zip)
+  zoho fn push <id|api_name> <file.ds> [--base <file.ds>]
+                                         Deluge 関数を差し替えて読み直す (即公開。--base と
+                                         今のコードが違えば送らない)
 
 path は crm/v8 が補われる (例: `zoho get Contracts fields=field11 per_page=200 --all`)。
 `settings/fields?module=Contracts` のように settings 配下もそのまま書ける。"""
@@ -410,6 +530,8 @@ def main():
         cmd_write(env, cmd.upper(), args)
     elif cmd == "coql":
         cmd_coql(env, args)
+    elif cmd == "fn":
+        cmd_fn(env, args)
     else:
         die(f"未知のコマンド: {cmd}\n\n{USAGE}")
     if _incomplete:
