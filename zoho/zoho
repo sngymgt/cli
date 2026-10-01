@@ -3,7 +3,9 @@
 
 import difflib
 import json
+import mimetypes
 import os
+import re
 import stat
 import sys
 import time
@@ -143,6 +145,39 @@ def cmd_auth(env, args):
     print(f"ok: {TOKENS_PATH} に保存しました (api_domain={res.get('api_domain')})")
 
 
+def cmd_revoke(env, args):
+    opts = [a for a in args if a in ("-y", "--yes")]
+    args = [a for a in args if a not in ("-y", "--yes")]
+    if len(args) != 1:
+        die("usage: zoho revoke <refresh_token | -> [-y]")
+    # 引数に直接書くとシェル履歴と ps に残るので、標準入力からも受ける
+    token = sys.stdin.readline().strip() if args[0] == "-" else args[0]
+    if not token:
+        die("トークンが空です")
+    stored = json.load(open(TOKENS_PATH)).get("refresh_token") if os.path.exists(TOKENS_PATH) else None
+    # tokens.json と同じ値が Secret Manager（zoho-connector）にも入っていて、毎朝のジョブが読む
+    if token == stored and not opts:
+        die("これは今 tokens.json で使っている refresh_token です。失効させるとコネクタも"
+            "止まります。分かったうえで消すなら -y を付けてください")
+    # 失敗時のエラーに URL を出すと token が端末に残るので、post_form は使わない
+    url = f"{env['ZOHO_ACCOUNTS_BASE']}/oauth/v2/token/revoke?" + urllib.parse.urlencode({"token": token})
+    req = urllib.request.Request(url, data=b"", method="POST")
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=60) as res:
+            raw = res.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        die(f"revoke -> {e.code} {e.read().decode(errors='replace')[:300]}")
+    except urllib.error.URLError as e:
+        die(f"Zoho に接続できません: {e.reason}")
+    try:
+        res = json.loads(raw)
+    except ValueError:
+        die(f"revoke -> JSON が返りませんでした: {raw[:300]}")
+    if res.get("status") != "success":
+        die(f"revoke できませんでした: {json.dumps(res, ensure_ascii=False)}")
+    print("ok: 失効させました" + ("（tokens.json の分です。`zoho auth` が必要）" if token == stored else ""))
+
+
 def access_token(env, force=False):
     t = load_tokens()
     if not force and t.get("access_token") and t.get("expires_at", 0) > time.time() + 60:
@@ -170,7 +205,51 @@ def origin(url):
 
 def allowed_origins(env, tokens):
     """トークンを付けて叩いてよいホスト。api_domain は認可時に Zoho が返した値。"""
-    return {origin(u) for u in (tokens.get("api_domain"), env["ZOHO_API_BASE"]) if u}
+    origins = {origin(u) for u in (tokens.get("api_domain"), env["ZOHO_API_BASE"]) if u}
+    # Bulk Write のアップロードなどファイル系の API は content.zohoapis.* に出る
+    content = {(scheme, "content." + host[len("www."):])
+               for scheme, host in origins if host.startswith("www.zohoapis.")}
+    return origins | content
+
+
+RESERVED_HEADERS = ("authorization", "host", "content-length")
+
+
+def take_flag(args, *names):
+    """names のどれかを取り除き、あったかどうかを返す。"""
+    rest = [a for a in args if a not in names]
+    return len(rest) != len(args), rest
+
+
+def take_values(args, *names):
+    """`-o x` のように値を取るオプションを (値の一覧, 残りの引数) に分ける。"""
+    values, rest, i = [], [], 0
+    while i < len(args):
+        if args[i] in names:
+            if i + 1 >= len(args):
+                die(f"{args[i]} には値が要ります")
+            values.append(args[i + 1])
+            i += 2
+        else:
+            rest.append(args[i])
+            i += 1
+    return values, rest
+
+
+def take_headers(args):
+    """`-H 'Name: value'`（繰り返し可）を dict にする。トークンの付け替えにならないよう
+    Authorization などは受けない。"""
+    raw, rest = take_values(args, "-H", "--header")
+    headers = {}
+    for h in raw:
+        name, sep, value = h.partition(":")
+        name = name.strip()
+        if not sep or not name:
+            die(f"不正なヘッダ: {h}（'Name: value' 形式）")
+        if name.lower() in RESERVED_HEADERS:
+            die(f"{name} は指定できません")
+        headers[name] = value.strip()
+    return headers, rest
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -194,7 +273,8 @@ def api_url(env, tokens, path):
     return f"{base}/{path}"
 
 
-def send(env, method, path, params=None, data=None, content_type=None, _retried=False):
+def send(env, method, path, params=None, data=None, content_type=None, headers=None,
+         _retried=False):
     """アクセストークンを付けて送り、(url, 応答ヘッダ, 本文のバイト列) を返す。"""
     global _last_call
     tokens = access_token(env)
@@ -202,6 +282,8 @@ def send(env, method, path, params=None, data=None, content_type=None, _retried=
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, data=data, method=method)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
     req.add_header("Authorization", f"Zoho-oauthtoken {tokens['access_token']}")
     if content_type:
         req.add_header("Content-Type", content_type)
@@ -216,12 +298,18 @@ def send(env, method, path, params=None, data=None, content_type=None, _retried=
     except urllib.error.HTTPError as e:
         # HTTPError は URLError の派生。この順序を入れ替えると 3xx と 401 の処理が死ぬ
         raw = e.read().decode(errors="replace")
+        if e.code == 304:
+            # If-Modified-Since に対する「更新なし」。エラーではないが、空の応答と
+            # 取り違えないよう stderr に残す
+            print("# 304 Not Modified（更新なし）", file=sys.stderr)
+            return url, e.headers, b""
         if 300 <= e.code < 400:
             die(f"{method} {url} -> {e.code} リダイレクトは追いません"
                 f"（転送先: {e.headers.get('Location')}）")
         if e.code == 401 and not _retried:
             access_token(env, force=True)
-            return send(env, method, path, params, data, content_type, _retried=True)
+            return send(env, method, path, params, data, content_type, headers,
+                        _retried=True)
         die(f"{method} {url} -> {e.code} {raw[:1000]}")
     except urllib.error.URLError as e:
         die(f"Zoho に接続できません: {e.reason}")
@@ -240,11 +328,11 @@ def decode_json(method, url, headers, raw):
         die(f"{method} {url} -> JSON が返りませんでした: {raw[:300]}")
 
 
-def call(env, method, path, params=None, body=None):
+def call(env, method, path, params=None, body=None, headers=None):
     data = json.dumps(body).encode() if body is not None else None
-    url, headers, raw = send(env, method, path, params, data,
-                             "application/json" if data else None)
-    return decode_json(method, url, headers, raw)
+    url, resp_headers, raw = send(env, method, path, params, data,
+                                  "application/json" if data else None, headers)
+    return decode_json(method, url, resp_headers, raw)
 
 
 def data_key(res):
@@ -261,18 +349,50 @@ def data_key(res):
     return cands[0] if len(cands) == 1 else None
 
 
+GET_USAGE = "usage: zoho get <path> [key=value ...] [--all] [-H 'Name: value'] [-o <file | -> [-y]]"
+
+
+def save_download(dest, raw, overwrite):
+    if dest == "-":
+        sys.stdout.buffer.write(raw)
+        return
+    # 顧客データを含みうるので、他のユーザーには読ませない
+    flags = os.O_CREAT | os.O_WRONLY | (os.O_TRUNC if overwrite else os.O_EXCL)
+    try:
+        fd = os.open(os.path.expanduser(dest), flags, 0o600)
+    except FileExistsError:
+        die(f"{dest} が既にあります。上書きするなら -y を付けてください")
+    except OSError as e:
+        die(f"{dest} に書けません: {e.strerror}")
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw)
+
+
 def cmd_get(env, args):
-    fetch_all = "--all" in args
-    args = [a for a in args if a != "--all"]
+    fetch_all, args = take_flag(args, "--all")
+    overwrite, args = take_flag(args, "-y", "--yes")
+    headers, args = take_headers(args)
+    outs, args = take_values(args, "-o", "--output")
     if not args:
-        die("usage: zoho get <path> [key=value ...] [--all]")
+        die(GET_USAGE)
     path, params = args[0], {}
     for a in args[1:]:
         if "=" not in a:
             die(f"不正な引数: {a} (key=value 形式)")
         k, v = a.split("=", 1)
         params[k] = v
-    res = call(env, "GET", path, params)
+    if outs:
+        if fetch_all:
+            die("-o と --all は一緒に使えません")
+        url, resp_headers, raw = send(env, "GET", path, params, headers=headers)
+        if not raw:
+            die(f"GET {url} -> 本文が空です（ファイルが無いか、更新なし）")
+        save_download(outs[-1], raw, overwrite)
+        name = resp_headers.get_filename()
+        print(f"ok: {len(raw)} バイトを {outs[-1]} に保存しました"
+              + (f"（元のファイル名: {name}）" if name else ""), file=sys.stderr)
+        return
+    res = call(env, "GET", path, params, headers=headers)
     if not fetch_all:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return
@@ -301,7 +421,7 @@ def cmd_get(env, args):
             # 優先して page を無視するので、同じページを永久に取り直す
             params.pop("page_token", None)
             params["page"] = int(params.get("page", 1)) + 1
-        res = call(env, "GET", path, params)
+        res = call(env, "GET", path, params, headers=headers)
         chunk = res.get(key)
         if not isinstance(chunk, list):
             incomplete(f"2 ページ目以降に {key} がありません。{len(rows)} 件で打ち切りました")
@@ -332,8 +452,9 @@ def read_body(args):
 def cmd_write(env, method, args):
     opts = [a for a in args if a in ("-y", "--yes")]
     args = [a for a in args if a not in ("-y", "--yes")]
+    headers, args = take_headers(args)
     if not args:
-        die(f"usage: zoho {method.lower()} <path> [@file | - | '<json>'] [-y]")
+        die(f"usage: zoho {method.lower()} <path> [@file | - | '<json>'] [-H 'Name: value'] [-y]")
     if method == "DELETE" and not opts:
         if not sys.stdin.isatty():
             die("DELETE は確認が要ります。非対話で実行するなら -y を付けてください")
@@ -343,7 +464,8 @@ def cmd_write(env, method, args):
         if input("本番の CRM を変更します。よろしいですか? [y/N] ").strip().lower() \
                 not in ("y", "yes"):
             die("中止しました")
-    res = call(env, method, args[0], body=read_body(args[1:]) if method != "DELETE" or args[1:] else None)
+    res = call(env, method, args[0], headers=headers,
+               body=read_body(args[1:]) if method != "DELETE" or args[1:] else None)
     print(json.dumps(res, ensure_ascii=False, indent=2))
     check_write_result(res)
 
@@ -361,14 +483,71 @@ def check_write_result(res):
         die(f"{len(rows)} 件中 {len(bad)} 件が失敗しました（{', '.join(codes)}）")
 
 
-def cmd_coql(env, args):
-    if not args:
-        die("usage: zoho coql \"select ... from Accounts where ...\"")
-    res = call(env, "POST", "coql", body={"select_query": args[0]})
+UPLOAD_USAGE = "usage: zoho upload <path> <file> [--field <name>] [-H 'Name: value']"
+
+
+def cmd_upload(env, args):
+    """ファイルを multipart で送る（添付・写真・Bulk Write の CSV など）。フィールド名の既定は file。"""
+    headers, args = take_headers(args)
+    fields, args = take_values(args, "--field")
+    if len(args) != 2:
+        die(UPLOAD_USAGE)
+    path, src = args
+    try:
+        with open(os.path.expanduser(src), "rb") as f:
+            data = f.read()
+    except OSError as e:
+        die(f"{src} を読めません: {e.strerror}")
+    if not data:
+        die(f"{src} が空です")
+    ctype = mimetypes.guess_type(src)[0] or "application/octet-stream"
+    body, content_type = multipart(fields[-1] if fields else "file", os.path.basename(src), data, ctype)
+    url, resp_headers, raw = send(env, "POST", path, data=body, content_type=content_type,
+                                  headers=headers)
+    res = decode_json("POST", url, resp_headers, raw)
     print(json.dumps(res, ensure_ascii=False, indent=2))
-    # COQL は 1 回 200 件が上限で、--all も無い。黙って上限で切れたと思わせない
-    if (res.get("info") or {}).get("more_records"):
-        incomplete("COQL は 1 回 200 件までです。LIMIT / OFFSET で分けてください")
+    check_write_result(res)
+
+
+COQL_PAGE = 200
+COQL_USAGE = "usage: zoho coql [--all] \"select ... from Accounts where ...\""
+
+
+def cmd_coql(env, args):
+    fetch_all, args = take_flag(args, "--all")
+    if len(args) != 1:
+        die(COQL_USAGE)
+    query = args[0].strip().rstrip(";")
+    if not fetch_all:
+        res = call(env, "POST", "coql", body={"select_query": query})
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        # 1 回 200 件が上限。黙って上限で切れたと思わせない
+        if (res.get("info") or {}).get("more_records"):
+            incomplete("COQL は 1 回 200 件までです。--all で全件取るか、LIMIT / OFFSET で分けてください")
+        return
+    if re.search(r"\b(limit|offset)\b", query, re.I):
+        die("--all は LIMIT / OFFSET を自分で付けたクエリには使えません")
+    # ORDER BY が無いと、ページをまたいで行が重複・欠落しうる
+    if not re.search(r"\border\s+by\b", query, re.I):
+        print("# ORDER BY が無いので、ページ境界で行が重複・欠落する恐れがあります"
+              "（`order by id` を付けると安定します）", file=sys.stderr)
+    rows, offset = [], 0
+    while True:
+        res = call(env, "POST", "coql",
+                   body={"select_query": f"{query} limit {COQL_PAGE} offset {offset}"})
+        chunk = res.get("data")
+        if not isinstance(chunk, list):
+            # 該当 0 件は 204 で本文が空になる。それ以外は取れなかった
+            if rows or res == {}:
+                break
+            incomplete(f"data がありません。{len(rows)} 件で打ち切りました")
+            break
+        rows.extend(chunk)
+        if not (res.get("info") or {}).get("more_records"):
+            break
+        offset += COQL_PAGE
+        print(f"  ... {len(rows)} 件", file=sys.stderr)
+    print(json.dumps({"data": rows, "info": {"count": len(rows)}}, ensure_ascii=False, indent=2))
 
 
 FN_USAGE = ("usage: zoho fn pull <id|api_name>\n"
@@ -405,11 +584,12 @@ def read_deluge(path):
     return data
 
 
-def multipart(name, filename, data):
+def multipart(name, filename, data, content_type="application/octet-stream"):
     boundary = uuid.uuid4().hex
+    filename = filename.replace("\\", "_").replace('"', "_").replace("\r", "_").replace("\n", "_")
     body = (f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
-            "Content-Type: application/octet-stream\r\n\r\n").encode() \
+            f"Content-Type: {content_type}\r\n\r\n").encode() \
         + data + f"\r\n--{boundary}--\r\n".encode()
     return body, f"multipart/form-data; boundary={boundary}"
 
@@ -503,10 +683,18 @@ def cmd_init():
 USAGE = """usage:
   zoho init                              設定ファイルの雛形を作る
   zoho auth <grant_token>                Self Client の grant token を交換して保存
+  zoho revoke <refresh_token | ->        refresh_token を 1 本失効させる (- は標準入力。
+                                         tokens.json の分は -y が要る)
   zoho token                             アクセストークンを更新して状態を表示
   zoho get <path> [k=v ...] [--all]      GET (--all で全ページ取得)
-  zoho post|put|patch|delete <path> [@file | - | '<json>']
-  zoho coql "<select_query>"             COQL クエリ
+           [-H 'Name: value'] [-o <file | -> [-y]]
+                                         -H はヘッダ追加（If-Modified-Since など。304 は exit 0）。
+                                         -o は JSON 以外（添付・Bulk の zip）をそのまま保存
+  zoho post|put|patch|delete <path> [@file | - | '<json>'] [-H 'Name: value']
+  zoho upload <path> <file> [--field <name>] [-H 'Name: value']
+                                         multipart で送る（添付・写真・Bulk Write の CSV。
+                                         content.zohoapis.* にも送れる）
+  zoho coql [--all] "<select_query>"     COQL クエリ (--all は LIMIT/OFFSET を自動で回す)
   zoho fn pull <id|api_name>             関数のコードを標準出力へ (Deluge は .ds、他は zip)
   zoho fn push <id|api_name> <file.ds> [--base <file.ds>]
                                          Deluge 関数を差し替えて読み直す (即公開。--base と
@@ -528,6 +716,8 @@ def main():
     env = load_env()
     if cmd == "auth":
         cmd_auth(env, args)
+    elif cmd == "revoke":
+        cmd_revoke(env, args)
     elif cmd == "token":
         t = access_token(env, force=True)
         print(f"ok: 有効期限 {time.strftime('%H:%M:%S', time.localtime(t['expires_at']))} / api_domain={t.get('api_domain')}")
@@ -537,6 +727,8 @@ def main():
         cmd_write(env, cmd.upper(), args)
     elif cmd == "coql":
         cmd_coql(env, args)
+    elif cmd == "upload":
+        cmd_upload(env, args)
     elif cmd == "fn":
         cmd_fn(env, args)
     else:

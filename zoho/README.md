@@ -8,7 +8,13 @@ Zoho CRM API v8 を直接叩く CLI。MCP では届かない操作（項目の�
 ## 注意
 
 - `--all` と `coql` は取り切れなかったら exit 1 になる（出力は途中まで）。
-  COQL は 1 回 200 件が上限なので、超えるなら LIMIT / OFFSET で分ける
+  COQL は 1 回 200 件が上限。`coql --all` は LIMIT / OFFSET を自動で回す
+  （`order by id` を付けないとページ境界で行が重複・欠落しうるので警告が出る）
+- `get -H 'If-Modified-Since: …'` で更新なしなら 304。stderr に出して exit 0、stdout は `{}`
+- `get -o <file>` は JSON 以外（添付・Bulk の zip）をそのまま保存する（600、既存なら `-y` で上書き）。
+  `upload <path> <file>` は multipart で送る。`content.zohoapis.*` にも送れる
+- `zoho revoke <refresh_token | ->` は refresh_token を 1 本失効させる。`tokens.json` の分は
+  Secret Manager のコネクタも止まるので `-y` が要る。Zoho にトークンの一覧 API は無い
 - 一括書き込みは HTTP 200 の中にレコード単位の失敗が入る。全件・一部が失敗したら exit 1 になる
 - `zoho delete` は確認を訊く。非対話で流すなら `-y`
 - `zoho fn push` は Deluge を**その場で公開する**（下書きが無い）。直し始めた版を `--base` に渡すと、
@@ -27,7 +33,7 @@ Zoho CRM API v8 を直接叩く CLI。MCP では届かない操作（項目の�
 ## 注意
 
 - 同じ API を秒間に叩きすぎると CONCURRENCY で落ちるため、CLI 側で間隔を空けている
-- 引数に絶対 URL を渡せるのは、設定した Zoho のオリジン（`api_domain` と `ZOHO_API_BASE`）に
-  一致する場合だけ。それ以外はアクセストークンを付けないよう拒否する。リダイレクトも追わない
+- 引数に絶対 URL を渡せるのは、設定した Zoho のオリジン（`api_domain` と `ZOHO_API_BASE`、
+  それと対の `content.zohoapis.*`）に一致する場合だけ。`-H` で Authorization は上書きできない。それ以外はアクセストークンを付けないよう拒否する。リダイレクトも追わない
 - サブフォームは一覧の GET では返らない。**エラーにならず「明細が空」と区別できない**ので、
   サブフォーム自体をモジュールとして読むこと
