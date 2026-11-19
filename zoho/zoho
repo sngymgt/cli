@@ -16,7 +16,7 @@ import urllib.request
 import uuid
 import webbrowser
 
-# 人用クライアントと Self Client を 1 台で使い分けるときは ZOHO_CONFIG_DIR で切り替える
+# 1 台で別の設定（別のクライアント・別の権限）を使い分けるときは ZOHO_CONFIG_DIR で切り替える
 CONFIG_DIR = os.path.expanduser(os.environ.get("ZOHO_CONFIG_DIR") or "~/.config/zoho")
 ENV_PATH = os.path.join(CONFIG_DIR, "env")
 TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")
@@ -98,7 +98,7 @@ def save_tokens(tokens):
 
 def load_tokens():
     if not os.path.exists(TOKENS_PATH):
-        die("未認証です。`zoho login` を実行してください（Self Client なら `zoho auth <grant_token>`）")
+        die("未認証です。`zoho login` を実行してください")
     with open(TOKENS_PATH) as f:
         return json.load(f)
 
@@ -124,38 +124,22 @@ def token_endpoint(env):
     return f"{env['ZOHO_ACCOUNTS_BASE']}/oauth/v2/token"
 
 
-def cmd_auth(env, args):
-    if not args:
-        die("usage: zoho auth <grant_token>")
-    res = post_form(token_endpoint(env), {
-        "grant_type": "authorization_code",
-        "client_id": env["ZOHO_CLIENT_ID"],
-        "client_secret": env["ZOHO_CLIENT_SECRET"],
-        "code": args[0],
-    })
-    if "refresh_token" not in res:
-        # res をそのまま出すと access_token が端末とスクロールバックに残る。
-        # offline アクセス無しの grant token だと access_token だけが返る
-        detail = res.get("error") or f"返ったキー: {', '.join(res)}"
-        die(f"refresh_token が返りませんでした（{detail}）。"
-            "grant token を offline アクセスで作り直してください")
-    save_tokens({
-        "access_token": res["access_token"],
-        "refresh_token": res["refresh_token"],
-        "expires_at": time.time() + int(res.get("expires_in", 3600)),
-        "api_domain": res.get("api_domain", env["ZOHO_API_BASE"]),
-    })
-    print(f"ok: {TOKENS_PATH} に保存しました (api_domain={res.get('api_domain')})")
-
-
-# login の既定。書く人だけ --write か --scope で広げる
+# login の既定。--write はレコードの読み書きまでで、設定（項目・関数など）を書くには --scope で明示する
 READ_SCOPES = ",".join([
     "ZohoCRM.modules.READ", "ZohoCRM.settings.READ", "ZohoCRM.users.READ",
     "ZohoCRM.org.READ", "ZohoCRM.coql.READ", "ZohoCRM.bulk.READ",
 ])
 WRITE_SCOPES = ",".join([
-    "ZohoCRM.modules.ALL", "ZohoCRM.settings.ALL", "ZohoCRM.users.READ",
-    "ZohoCRM.org.READ", "ZohoCRM.coql.READ", "ZohoCRM.bulk.ALL",
+    "ZohoCRM.modules.ALL", "ZohoCRM.settings.READ", "ZohoCRM.users.READ",
+    "ZohoCRM.org.READ", "ZohoCRM.coql.READ", "ZohoCRM.bulk.READ",
+])
+
+
+# 設定（項目・レイアウト・関数・自動化）も書く人向け。サーバーのジョブの業務用トークンと同じ範囲
+ADMIN_SCOPES = ",".join([
+    "ZohoCRM.modules.ALL", "ZohoCRM.settings.ALL", "ZohoCRM.users.ALL", "ZohoCRM.org.ALL",
+    "ZohoCRM.bulk.ALL", "ZohoCRM.coql.READ", "ZohoCRM.functions.execute.READ",
+    "ZohoCRM.functions.execute.CREATE",
 ])
 
 
@@ -181,11 +165,14 @@ def cmd_login(env, args):
     write, args = take_flag(args, "--write")
     if write:
         scope = WRITE_SCOPES
+    admin, args = take_flag(args, "--admin")
+    if admin:
+        scope = ADMIN_SCOPES
     values, args = take_values(args, "--scope")
     if values:
         scope = values[-1]
     if args:
-        die("usage: zoho login [--write | --scope <scope,...>]")
+        die("usage: zoho login [--write | --admin | --scope <scope,...>]")
     base = env["ZOHO_ACCOUNTS_BASE"]
     res = post_device(f"{base}/oauth/v3/device/code", {
         "client_id": env["ZOHO_CLIENT_ID"],
@@ -253,7 +240,7 @@ def cmd_revoke(env, args):
         die("これは今 tokens.json で使っている refresh_token です。同じ値を他で使っていれば"
             "そちらも止まります。分かったうえで消すなら -y を付けてください")
     revoke_token(env, token)
-    print("ok: 失効させました" + ("（tokens.json の分です。`zoho auth` が必要）" if token == stored else ""))
+    print("ok: 失効させました" + ("（tokens.json の分です。`zoho login` が必要）" if token == stored else ""))
 
 
 def cmd_logout(env, args):
@@ -300,7 +287,7 @@ def access_token(env, force=False):
         "refresh_token": t["refresh_token"],
     })
     if "access_token" not in res:
-        die(f"リフレッシュ失敗: {json.dumps(res, ensure_ascii=False)}. `zoho login`（Self Client なら `zoho auth`）をやり直してください")
+        die(f"リフレッシュ失敗: {json.dumps(res, ensure_ascii=False)}. `zoho login` をやり直してください")
     t["access_token"] = res["access_token"]
     t["expires_at"] = time.time() + int(res.get("expires_in", 3600))
     if res.get("api_domain"):
@@ -804,10 +791,11 @@ def cmd_init():
 
 USAGE = """usage:
   zoho init                              設定ファイルの雛形を作る
-  zoho login [--write | --scope <s,...>] ブラウザで承認して保存（Non-browser Applications の
-                                         クライアント。既定は読むだけ、--write で書き込みも）
+  zoho login [--write | --admin | --scope <s,...>]
+                                         ブラウザで承認して保存（Non-browser Applications の
+                                         クライアント。既定は読むだけ、--write でレコードの書き込みも、
+                                         --admin で設定・関数の実行まで）
   zoho logout -y                         tokens.json の refresh_token を失効させて消す（やめるとき）
-  zoho auth <grant_token>                Self Client の grant token を交換して保存
   zoho revoke <refresh_token | ->        refresh_token を 1 本失効させる (- は標準入力。
                                          tokens.json の分は -y が要る)
   zoho token                             アクセストークンを更新して状態を表示
@@ -841,8 +829,6 @@ def main():
     env = load_env()
     if cmd == "login":
         cmd_login(env, args)
-    elif cmd == "auth":
-        cmd_auth(env, args)
     elif cmd == "revoke":
         cmd_revoke(env, args)
     elif cmd == "logout":

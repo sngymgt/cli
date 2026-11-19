@@ -36,18 +36,19 @@ zoho init
       （人には送らない。ログインできる人は各自でここから写す）
 2. `zoho init` が 2 つを訊くので貼る。`~/.config/zoho/env`（600）に入る。既にあれば何もしない
    （端末でないときは空の雛形を作る。データセンターは `ZOHO_DC=jp`）
-3. `zoho login` で表示される URL をブラウザで開いて承認する。既定は読むだけで、書き込みも要るなら
-   `zoho login --write`
+3. `zoho login` で表示される URL をブラウザで開いて承認する。既定は読むだけで、レコードを書くなら
+   `zoho login --write`。設定（項目・レイアウト・関数など）を書くスコープは `--write` に含めない。
+   設定も触る人だけ `zoho login --admin`
 
 **サーバーのジョブと同じクライアントを人に配らない。** Zoho の refresh_token は同じクライアント・
 同じユーザーで 20 本までで、超えると使用中でも一番古いものが消える。人が `login` を繰り返して
 ジョブのトークンを押し出さないよう、ジョブは Self Client、人は Non-browser Applications と分ける。
-Self Client の grant token は `zoho auth <grant_token>` で交換する。
+ジョブのトークンの発行はこの CLI ではなく、ジョブを持つリポジトリのスクリプトでやる。
 
 使うのをやめるときは `zoho logout -y` で自分のトークンを失効させる。
 
 トークンは `~/.config/zoho/tokens.json`（600）に入り、失効時は refresh token で自動更新される。
-`zoho token` で状態を確認できる。1 台で 2 つのクライアントを使い分けるときは `ZOHO_CONFIG_DIR` で
+`zoho token` で状態を確認できる。1 台で別の設定を使い分けるときは `ZOHO_CONFIG_DIR` で
 設定ディレクトリを切り替える。
 
 ## 注意
