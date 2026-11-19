@@ -37,8 +37,9 @@ GWS_PROFILE=<name> gws ...      同上
   他のプロファイルは巻き添えにならない
 - 本体の `auth login` の選択画面は `cloud-platform` / `pubsub` に既定でチェックが入っている。
   Workspace のアカウントでこれを許可すると Google Cloud のセッション制御の対象になり、
-  十数時間ごとに `invalid_rapt` で切れる。`<プロファイル>/scopes` に 1 行 1 スコープを書いておくと
-  `auth login` がそのスコープで認可する（短い名前は URL に展開する。本体の `--scopes` は展開しない）。
-  `--scopes` / `--services` / `--full` / `--readonly` を明示したときは使わない
+  十数時間ごとに `invalid_rapt` で切れる。そのためラッパーの `auth login` は選択画面を出さず、
+  Cloud 系を除いた既定のスコープ（`DEFAULT_SCOPES`）で認可する。プロファイルごとに変えるときは
+  `<プロファイル>/scopes` に 1 行 1 スコープを書く（短い名前は URL に展開する。本体の `--scopes` は展開しない）。
+  `--scopes` / `--services` / `--full` / `--readonly` を明示したときはそのまま本体に渡す
 - `GOOGLE_WORKSPACE_CLI_{TOKEN,CREDENTIALS_FILE,CLIENT_ID,CLIENT_SECRET}` が設定されていると
   プロファイルより優先されるため、ラッパー側で解除して警告する

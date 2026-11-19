@@ -113,10 +113,22 @@ resolve_label() {
 
 # 本体の選択画面は cloud-platform / pubsub に既定でチェックが入っている。これを許可すると
 # Google Cloud のセッション制御の対象になり、refresh token が十数時間で invalid_rapt になる。
+# 選択画面を出さずにこの一覧で認可する。Cloud 系のスコープをここに足さないこと
+DEFAULT_SCOPES='
+drive
+spreadsheets
+gmail.modify
+calendar
+documents
+presentations
+tasks
+'
+
+# プロファイルに scopes ファイルがあればそれを、無ければ DEFAULT_SCOPES を返す。
 # 本体の --scopes は短い名前を展開せずそのまま送る（drive が無効なスコープになる）ので、ここで URL にする
-profile_scopes() {
-  local file="$1/scopes" line out=""
-  [ -f "$file" ] || return 1
+login_scopes() {
+  local file="$1/scopes" src line out=""
+  if [ -f "$file" ]; then src="$(cat "$file")"; else src="$DEFAULT_SCOPES"; fi
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%%#*}"
     line="$(printf '%s' "$line" | tr -d '[:space:]')"
@@ -126,7 +138,7 @@ profile_scopes() {
       *) line="https://www.googleapis.com/auth/$line" ;;
     esac
     out="${out:+$out,}$line"
-  done < "$file"
+  done <<< "$src"
   [ -n "$out" ] || return 1
   printf '%s\n' "$out"
 }
@@ -162,9 +174,10 @@ gws profile — gws の認証情報プロファイルを切り替える
   GWS_PROFILE_ROOT=<dir>          プロファイル置き場（既定 ~/.config/gws-profiles）
   GWS_PROFILE_PASSTHROUGH=1       profile も本体に渡す（本体側の profile を使うとき）
 
-<プロファイル>/scopes に 1 行 1 スコープ（drive / gmail.modify などの短い名前か URL。# 以降は無視）を
-書いておくと、gws auth login は選択画面を出さずにそのスコープで認可する。
---scopes / --services / --full / --readonly を付けたときは scopes ファイルを使わない。
+gws auth login は選択画面を出さず、既定のスコープ（drive / spreadsheets / gmail.modify / calendar /
+documents / presentations / tasks。cloud-platform と pubsub は含めない）で認可する。
+プロファイルごとに変えるには <プロファイル>/scopes に 1 行 1 スコープ（短い名前か URL。# 以降は無視）を書く。
+--scopes / --services / --full / --readonly を付けたときはそれをそのまま本体に渡す。
 
 GOOGLE_WORKSPACE_CLI_{TOKEN,CREDENTIALS_FILE,CLIENT_ID,CLIENT_SECRET} は
 プロファイルより優先されてしまうため、設定されていれば解除して警告する。
@@ -260,7 +273,7 @@ cmd_profile() {
       fi
 
       local scopes
-      if ! has_scope_flag ${login_args[@]+"${login_args[@]}"} && scopes="$(profile_scopes "$dir")"; then
+      if ! has_scope_flag ${login_args[@]+"${login_args[@]}"} && scopes="$(login_scopes "$dir")"; then
         login_args+=(--scopes "$scopes")
       fi
       echo "ブラウザで '$name' としてログインします..."
@@ -468,8 +481,12 @@ for _v in GOOGLE_WORKSPACE_CLI_TOKEN GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE \
 done
 
 if [ "${1:-}" = "auth" ] && [ "${2:-}" = "login" ] && ! has_scope_flag "${@:3}"; then
-  if _scopes="$(profile_scopes "$config_dir")"; then
-    echo "gws: '$profile' の既定スコープで認可します（$config_dir/scopes）" >&2
+  if _scopes="$(login_scopes "$config_dir")"; then
+    if [ -f "$config_dir/scopes" ]; then
+      echo "gws: '$profile' の scopes ファイルのスコープで認可します（$config_dir/scopes）" >&2
+    else
+      echo "gws: 既定のスコープで認可します（Cloud 系を除く。変えるには --scopes か $config_dir/scopes）" >&2
+    fi
     set -- "$@" --scopes "$_scopes"
   fi
 fi
