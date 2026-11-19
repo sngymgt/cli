@@ -44,6 +44,8 @@ zoho init
 ジョブのトークンを押し出さないよう、ジョブは Self Client、人は Non-browser Applications と分ける。
 Self Client の grant token は `zoho auth <grant_token>` で交換する。
 
+使うのをやめるときは `zoho logout -y` で自分のトークンを失効させる。
+
 トークンは `~/.config/zoho/tokens.json`（600）に入り、失効時は refresh token で自動更新される。
 `zoho token` で状態を確認できる。1 台で 2 つのクライアントを使い分けるときは `ZOHO_CONFIG_DIR` で
 設定ディレクトリを切り替える。

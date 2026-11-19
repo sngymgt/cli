@@ -252,6 +252,25 @@ def cmd_revoke(env, args):
     if token == stored and not opts:
         die("これは今 tokens.json で使っている refresh_token です。同じ値を他で使っていれば"
             "そちらも止まります。分かったうえで消すなら -y を付けてください")
+    revoke_token(env, token)
+    print("ok: 失効させました" + ("（tokens.json の分です。`zoho auth` が必要）" if token == stored else ""))
+
+
+def cmd_logout(env, args):
+    yes = any(a in ("-y", "--yes") for a in args)
+    if [a for a in args if a not in ("-y", "--yes")]:
+        die("usage: zoho logout [-y]")
+    if not os.path.exists(TOKENS_PATH):
+        die("tokens.json がありません（ログインしていません）")
+    if not yes:
+        die("tokens.json の refresh_token を失効させて消します。同じ値を他（サーバーのジョブなど）で"
+            "使っていればそちらも止まります。分かったうえで消すなら -y を付けてください")
+    revoke_token(env, load_tokens()["refresh_token"])
+    os.unlink(TOKENS_PATH)
+    print(f"ok: 失効させて {TOKENS_PATH} を消しました")
+
+
+def revoke_token(env, token):
     # 失敗時のエラーに URL を出すと token が端末に残るので、post_form は使わない
     url = f"{env['ZOHO_ACCOUNTS_BASE']}/oauth/v2/token/revoke?" + urllib.parse.urlencode({"token": token})
     req = urllib.request.Request(url, data=b"", method="POST")
@@ -268,7 +287,6 @@ def cmd_revoke(env, args):
         die(f"revoke -> JSON が返りませんでした: {raw[:300]}")
     if res.get("status") != "success":
         die(f"revoke できませんでした: {json.dumps(res, ensure_ascii=False)}")
-    print("ok: 失効させました" + ("（tokens.json の分です。`zoho auth` が必要）" if token == stored else ""))
 
 
 def access_token(env, force=False):
@@ -282,7 +300,7 @@ def access_token(env, force=False):
         "refresh_token": t["refresh_token"],
     })
     if "access_token" not in res:
-        die(f"リフレッシュ失敗: {json.dumps(res, ensure_ascii=False)}. `zoho auth` をやり直してください")
+        die(f"リフレッシュ失敗: {json.dumps(res, ensure_ascii=False)}. `zoho login`（Self Client なら `zoho auth`）をやり直してください")
     t["access_token"] = res["access_token"]
     t["expires_at"] = time.time() + int(res.get("expires_in", 3600))
     if res.get("api_domain"):
@@ -788,6 +806,7 @@ USAGE = """usage:
   zoho init                              設定ファイルの雛形を作る
   zoho login [--write | --scope <s,...>] ブラウザで承認して保存（Non-browser Applications の
                                          クライアント。既定は読むだけ、--write で書き込みも）
+  zoho logout -y                         tokens.json の refresh_token を失効させて消す（やめるとき）
   zoho auth <grant_token>                Self Client の grant token を交換して保存
   zoho revoke <refresh_token | ->        refresh_token を 1 本失効させる (- は標準入力。
                                          tokens.json の分は -y が要る)
@@ -826,6 +845,8 @@ def main():
         cmd_auth(env, args)
     elif cmd == "revoke":
         cmd_revoke(env, args)
+    elif cmd == "logout":
+        cmd_logout(env, args)
     elif cmd == "token":
         t = access_token(env, force=True)
         print(f"ok: 有効期限 {time.strftime('%H:%M:%S', time.localtime(t['expires_at']))} / api_domain={t.get('api_domain')}")
