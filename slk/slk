@@ -1977,6 +1977,7 @@ def cmd_login(args):
         # user token の scope は以前の認可と足し合わされるので、--write を外しても書ける権限が残る
         warn("このトークンには以前の認可で書き込みの権限が残っています"
              "（外すにはアプリの認可を取り消してから slk login し直す）")
+    auth = call(token, "auth.test")
     # 上書きしてよいのは「同じワークスペースの同じ人」のプロファイルだけ。team_id だけで
     # 一致を見ると、同じワークスペースの別アカウントで入ったときに他方を潰す
     ident = (auth.get("team_id"), auth.get("user_id"))
