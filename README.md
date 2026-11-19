@@ -23,8 +23,8 @@ for t in slk zoho mf tldv gws zp; do ln -s "$PWD/$t/$t" ~/.local/bin/$t; done
 
 必要なものだけ symlink すればよい。`~/.local/bin` に PATH が通っていること。更新は `git pull` だけ。
 
-Windows で動くのは今のところ `slk` と `gws`（Git Bash から）だけ（手順は [slk/README.md](slk/README.md)・
-[gws/README.md](gws/README.md)）。
+Windows で動くのは今のところ `slk`・`gws`（Git Bash から）・`zoho` だけ（手順は [slk/README.md](slk/README.md)・
+[gws/README.md](gws/README.md)・[zoho/README.md](zoho/README.md)）。
 
 ## セットアップ
 

@@ -36,9 +36,25 @@ def incomplete(msg):
     print(f"# {msg}", file=sys.stderr)
 
 
+# Windows の os.open は既定がテキストモードで、書いた \n が \r\n に化ける（ダウンロードした zip が壊れる）
+O_BINARY = getattr(os, "O_BINARY", 0)
+
+
 def secure(path, mode):
     """権限を必ず mode まで絞る。makedirs(mode=) は既存ディレクトリには効かず、
-    作成時の mode も umask で削られるので、実行のたびに現在値を見て直す。"""
+    作成時の mode も umask で削られるので、実行のたびに現在値を見て直す。
+    Windows の chmod は読み取り専用の切り替えしかできないので、本人だけが読めるユーザーフォルダの
+    既定の ACL に任せ、その外（共有フォルダなど）に置かせない。"""
+    if os.name == "nt":
+        home = os.path.realpath(os.environ.get("USERPROFILE") or os.path.expanduser("~"))
+        real = os.path.realpath(path)
+        try:
+            inside = os.path.normcase(os.path.commonpath([home, real])) == os.path.normcase(home)
+        except ValueError:  # 別のドライブ・UNC
+            inside = False
+        if not inside:
+            die(f"{path} はユーザーフォルダ（{home}）の外です。他の人が読めるおそれがあるので置けません")
+        return
     current = stat.S_IMODE(os.stat(path).st_mode)
     if current != mode:
         os.chmod(path, mode)
@@ -57,7 +73,7 @@ def load_env():
     secure(CONFIG_DIR, 0o700)
     secure(ENV_PATH, 0o600)
     env = {}
-    with open(ENV_PATH) as f:
+    with open(ENV_PATH, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -85,9 +101,9 @@ def save_tokens(tokens):
     secure(CONFIG_DIR, 0o700)
     tmp = TOKENS_PATH + ".tmp"
     # open() してから chmod すると、その間は umask の権限で refresh_token が読める
-    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | O_BINARY, 0o600)
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(tokens, f, indent=2)
         os.replace(tmp, TOKENS_PATH)
     except BaseException:
@@ -99,7 +115,7 @@ def save_tokens(tokens):
 def load_tokens():
     if not os.path.exists(TOKENS_PATH):
         die("未認証です。`zoho login` を実行してください")
-    with open(TOKENS_PATH) as f:
+    with open(TOKENS_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -234,7 +250,7 @@ def cmd_revoke(env, args):
     token = sys.stdin.readline().strip() if args[0] == "-" else args[0]
     if not token:
         die("トークンが空です")
-    stored = json.load(open(TOKENS_PATH)).get("refresh_token") if os.path.exists(TOKENS_PATH) else None
+    stored = json.load(open(TOKENS_PATH, encoding="utf-8")).get("refresh_token") if os.path.exists(TOKENS_PATH) else None
     # 同じ値を手元以外（サーバーのジョブなど）に入れていると、そちらも止まる
     if token == stored and not opts:
         die("これは今 tokens.json で使っている refresh_token です。同じ値を他で使っていれば"
@@ -457,7 +473,7 @@ def save_download(dest, raw, overwrite):
     # 顧客データを含みうるので、他のユーザーには読ませない
     flags = os.O_CREAT | os.O_WRONLY | (os.O_TRUNC if overwrite else os.O_EXCL)
     try:
-        fd = os.open(os.path.expanduser(dest), flags, 0o600)
+        fd = os.open(os.path.expanduser(dest), flags | O_BINARY, 0o600)
     except FileExistsError:
         die(f"{dest} が既にあります。上書きするなら -y を付けてください")
     except OSError as e:
@@ -542,7 +558,8 @@ def read_body(args):
     if src == "-":
         return json.load(sys.stdin)
     if src.startswith("@"):
-        with open(os.path.expanduser(src[1:])) as f:
+        # Windows PowerShell 5.1 の `Out-File -Encoding utf8` は BOM を付けるので、BOM ありも読む
+        with open(os.path.expanduser(src[1:]), encoding="utf-8-sig") as f:
             return json.load(f)
     return json.loads(src)
 
@@ -766,6 +783,10 @@ def cmd_init():
         print(f"既に {ENV_PATH} があります")
         return
     client_id = client_secret = ""
+    # Git Bash（mintty）は端末として見えないので入力を訊けない。ここで空の雛形を作ると、
+    # PowerShell で流し直しても「既にある」で止まる
+    if os.name == "nt" and not sys.stdin.isatty():
+        die("この端末では入力を訊けません。PowerShell かコマンドプロンプトで `zoho init` を流してください")
     if sys.stdin.isatty():
         print("https://api-console.zoho.jp/ の Non-browser Applications のクライアントの値を入れてください"
               "（Client Secret タブ）", file=sys.stderr)
@@ -775,8 +796,8 @@ def cmd_init():
             die("Client ID と Client Secret の両方が要ります")
     # exists と open("w") を分けると、その隙に作られた env を切り詰めて
     # client_secret を失う。O_EXCL で名前の確保ごと不可分にする
-    fd = os.open(ENV_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w") as f:
+    fd = os.open(ENV_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY | O_BINARY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(
             "# https://api-console.zoho.jp/ で発行した値（人は Non-browser Applications のクライアント）\n"
             f"ZOHO_CLIENT_ID={client_id}\n"
@@ -817,7 +838,23 @@ path は crm/v8 が補われる (例: `zoho get Contracts fields=field11 per_pag
 `settings/fields?module=Contracts` のように settings 配下もそのまま書ける。"""
 
 
+def utf8_stdio():
+    """Windows ではパイプやファイルにつないだ標準入出力が ANSI コードページ（日本語なら cp932）に
+    なり、cp932 に無い文字で UnicodeEncodeError になる。AI エージェント（Claude Code は Git Bash）
+    から使うと常にこの状態なので、端末以外は UTF-8 にする。端末は Python が Unicode のまま
+    書くので触らない。PYTHONIOENCODING / PYTHONUTF8 で明示されていればそれに従う。"""
+    if os.name != "nt" or os.environ.get("PYTHONIOENCODING") or sys.flags.utf8_mode:
+        return
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            if stream and not stream.isatty():
+                stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main():
+    utf8_stdio()
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(USAGE)
