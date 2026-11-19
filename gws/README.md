@@ -25,6 +25,38 @@ GWS_PROFILE=<name> gws ...      同上
 
 プロファイルは `~/.config/gws-profiles/<name>/`、有効なものは同ディレクトリの `active`。
 
+### Windows
+
+Git for Windows（Git Bash）の上で動く。Claude Code は Windows でも Git Bash でコマンドを叩くので、
+AI から使う分にはこれで足りる。clone 先は以下 `<clone 先>` と書く。
+
+1. 本体を置く。PowerShell で:
+
+   ```
+   $d = "$env:LOCALAPPDATA\Programs\gws"
+   New-Item -ItemType Directory -Force $d | Out-Null
+   Invoke-WebRequest https://github.com/googleworkspace/cli/releases/latest/download/google-workspace-cli-x86_64-pc-windows-msvc.zip -OutFile "$env:TEMP\gws.zip"
+   Expand-Archive "$env:TEMP\gws.zip" $d -Force
+   ```
+
+   ラッパーは PATH に無くても `%LOCALAPPDATA%\Programs\gws\gws.exe` を見つける
+2. Git Bash で入口を置く（Git Bash は `#!` を読まず `ln -s` も実体のコピーになるため。
+   `~/bin` に PATH が通っている前提）:
+
+   ```
+   mkdir -p ~/bin
+   printf '#!/bin/sh\nexec bash "%s" "$@"\n' "$(cd <clone 先> && pwd)/gws/gws" > ~/bin/gws
+   chmod +x ~/bin/gws
+   ```
+
+3. OAuth クライアント（`client_secret.json`。管理者から受け取る）を取り込んでログイン:
+   `gws profile add <name> --client <client_secret.json のパス>`
+
+- 鍵は Windows 資格情報マネージャーに入る。プロファイルの置き場は Mac と同じ `~/.config/gws-profiles/`
+- Windows では `cache` をプロファイル間で共有しない（各プロファイルに数 MB ずつできる）
+- PowerShell から手で叩くのは勧めない。Windows PowerShell 5.1 は外部コマンドに渡す引数から
+  `"` を落とすので、`--params '{"pageSize":1}'` のような JSON が壊れる
+
 ## 注意
 
 - discovery ドキュメントは数 MB あるがアカウントに依存しないため、`add` で作った

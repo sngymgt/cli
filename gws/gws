@@ -11,34 +11,63 @@ PROFILE_ROOT="${GWS_PROFILE_ROOT:-$HOME/.config/gws-profiles}"
 ACTIVE_FILE="$PROFILE_ROOT/active"
 LEGACY_CONFIG="$HOME/.config/gws"
 
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) on_windows=1 ;;
+  *) on_windows=0 ;;
+esac
+
+# Windows（Git Bash）では本体を gws.exe の名前でだけ探す。Git Bash は #! を読まないので、
+# このスクリプトは ~/bin/gws などの入口から bash 経由で起動される。その入口も PATH 上の
+# 「gws」なので、名前で探すと入口を本体と取り違え、入口→wrapper→入口と exec が往復する
+if [ "$on_windows" -eq 1 ]; then
+  bin_name="gws.exe"
+else
+  bin_name="gws"
+fi
+
 self_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 real_gws=""
 IFS=':' read -r -a _path_parts <<< "$PATH"
 for _d in "${_path_parts[@]}"; do
   [ -n "$_d" ] || continue
-  [ -x "$_d/gws" ] || continue
+  [ -x "$_d/$bin_name" ] || continue
   # 実体（デバイス:inode）で比較する。パス文字列だと、同じ wrapper への symlink が
   # PATH に 2 つあるだけで互いを「別のプログラム」と見なし、exec が往復して止まらない
-  _cand="$(cd "$_d" && pwd -P)/gws"
-  _id_a="$(stat -f '%d:%i' "$_d/gws" 2>/dev/null || true)"
-  _id_b="$(stat -f '%d:%i' "$self_path" 2>/dev/null || true)"
-  if [ -n "$_id_a" ] && [ "$_id_a" = "$_id_b" ]; then
-    continue
-  fi
-  # stat が使えない環境ではパス比較に戻す（自分を実体と誤認する方が危ない）
-  [ "$_cand" = "$self_path" ] && continue
-  real_gws="$_d/gws"
+  [ "$_d/$bin_name" -ef "$self_path" ] && continue
+  real_gws="$_d/$bin_name"
   break
 done
 if [ -z "$real_gws" ]; then
-  for _c in /opt/homebrew/bin/gws /usr/local/bin/gws; do
-    [ -x "$_c" ] && { real_gws="$_c"; break; }
+  if [ "$on_windows" -eq 1 ]; then
+    _cands=()
+    if [ -n "${LOCALAPPDATA:-}" ]; then
+      _cands+=("$(cygpath -u "$LOCALAPPDATA")/Programs/gws/gws.exe")
+    fi
+  else
+    _cands=(/opt/homebrew/bin/gws /usr/local/bin/gws)
+  fi
+  for _c in ${_cands[@]+"${_cands[@]}"}; do
+    if [ -x "$_c" ]; then real_gws="$_c"; break; fi
   done
 fi
 if [ -z "$real_gws" ]; then
-  echo "gws: googleworkspace-cli の実体が見つかりません (brew install googleworkspace-cli)" >&2
+  if [ "$on_windows" -eq 1 ]; then
+    echo "gws: googleworkspace-cli の実体が見つかりません（gws.exe を %LOCALAPPDATA%\\Programs\\gws\\ に置く）" >&2
+  else
+    echo "gws: googleworkspace-cli の実体が見つかりません (brew install googleworkspace-cli)" >&2
+  fi
   exit 127
 fi
+
+# 本体は Windows のプログラムなので、Git Bash のパス（/c/Users/…）を環境変数で渡しても読めない
+# （引数は Git Bash が変換するが、環境変数が変換されるかは当てにできない）
+native_path() {
+  if [ "$on_windows" -eq 1 ]; then
+    cygpath -w "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
 
 die() { echo "gws profile: $*" >&2; exit 1; }
 
@@ -52,7 +81,8 @@ require_name() {
 ensure_root() {
   mkdir -p "$PROFILE_ROOT"
   [ -n "$(list_profiles)" ] && return 0
-  if [ -d "$LEGACY_CONFIG" ]; then
+  # Git Bash の ln -s は既定で実体のコピーを作る。認証情報が 2 か所に割れるので Windows では使わない
+  if [ -d "$LEGACY_CONFIG" ] && [ "$on_windows" -eq 0 ]; then
     ln -s "$LEGACY_CONFIG" "$PROFILE_ROOT/default"
   else
     mkdir -p "$PROFILE_ROOT/default"
@@ -101,10 +131,10 @@ first_email() {
 # scope, which is the scope people actually grant; gmail is the fallback.
 resolve_label() {
   local dir="$1" out email
-  out="$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$dir" "$real_gws" drive about get --params '{"fields":"user"}' 2>/dev/null || true)"
+  out="$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$(native_path "$dir")" "$real_gws" drive about get --params '{"fields":"user"}' 2>/dev/null || true)"
   email="$(first_email "$out")"
   if [ -z "$email" ]; then
-    out="$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$dir" "$real_gws" gmail users getProfile --params '{"userId":"me"}' 2>/dev/null || true)"
+    out="$(GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$(native_path "$dir")" "$real_gws" gmail users getProfile --params '{"userId":"me"}' 2>/dev/null || true)"
     email="$(first_email "$out")"
   fi
   [ -n "$email" ] || return 1
@@ -262,7 +292,8 @@ cmd_profile() {
         echo "スコープは '$seed' から複製しました（$dir/scopes）"
       fi
       # Discovery docs are account-independent and ~7MB, so share one copy.
-      if [ -d "$(profile_dir "$seed")/cache" ] && [ ! -e "$dir/cache" ]; then
+      # Windows では ln -s がコピーになり共有にならないので、本体に作らせる
+      if [ "$on_windows" -eq 0 ] && [ -d "$(profile_dir "$seed")/cache" ] && [ ! -e "$dir/cache" ]; then
         ln -s "$(profile_dir "$seed")/cache" "$dir/cache"
       fi
 
@@ -277,7 +308,7 @@ cmd_profile() {
         login_args+=(--scopes "$scopes")
       fi
       echo "ブラウザで '$name' としてログインします..."
-      if GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$dir" "$real_gws" auth login ${login_args[@]+"${login_args[@]}"}; then
+      if GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$(native_path "$dir")" "$real_gws" auth login ${login_args[@]+"${login_args[@]}"}; then
         local email
         if email="$(resolve_label "$dir")"; then
           printf '%s\n' "$email" > "$dir/.label"
@@ -491,5 +522,5 @@ if [ "${1:-}" = "auth" ] && [ "${2:-}" = "login" ] && ! has_scope_flag "${@:3}";
   fi
 fi
 
-export GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir"
+export GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$(native_path "$config_dir")"
 exec "$real_gws" "$@"

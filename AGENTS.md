@@ -129,7 +129,13 @@ gws について:
   返すので、`profile rm` のガードに使うと active に書かれている方を消せてしまう。
   ガードは `ACTIVE_FILE` を直接読む
 - **自分自身の検出をパス文字列で比較しない。** 同じ wrapper への symlink が PATH に
-  2 つあると互いを別物と見なし、`exec` が往復して止まらない。実体（`stat -f '%d:%i'`）で見る
+  2 つあると互いを別物と見なし、`exec` が往復して止まらない。実体（`[ a -ef b ]`）で見る
+- **Windows で本体を `gws` の名前で探さない。** Git Bash の入口（`~/bin/gws`）を本体と取り違え、
+  入口→wrapper→入口と `exec` が往復する。`gws.exe` だけを探す
+- **Windows で `ln -s` を使わない。** Git Bash では実体のコピーになり、認証情報が 2 か所に割れる
+- **`GOOGLE_WORKSPACE_CLI_CONFIG_DIR` に Git Bash のパスを渡さない。** `native_path` で Windows の形にする
+- **`DEFAULT_SCOPES` に `cloud-platform` / `pubsub` を足さない。** Google Cloud のセッション制御の
+  対象になり、refresh token が十数時間で `invalid_rapt` になる
 - **`first_email` の `|| true` を外さない。** `pipefail` が有効なので、`grep` の不一致と
   `head` による SIGPIPE がそのまま呼び出し側の `set -e` に伝わって落ちる
 
