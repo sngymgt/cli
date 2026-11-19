@@ -33,11 +33,19 @@ zoho init
 
 Windows は下の「Windows」で入れてから、同じ手順 1〜3 を PowerShell で流す。
 
-1. Client ID / Client Secret を手に入れる
-   1. ブラウザで共有アカウントとして Zoho にログインした状態で <https://api-console.zoho.jp/> を開く
-   2. クライアントの一覧から **CLI**（Non-browser Applications）を開く
-   3. 「Client Secret」タブに出る Client ID と Client Secret を、次の `zoho init` に貼る
-      （人には送らない。ログインできる人は各自でここから写す）
+1. 自分用の「クライアント」を作り、Client ID / Client Secret を手に入れる（最初の 1 回だけ）
+   1. ブラウザで**自分の** Zoho アカウントにログインした状態で <https://api-console.zoho.jp/> を開く
+   2. 「GET STARTED」か「ADD CLIENT」を押す
+   3. Client Type で **Non-browser Applications** を選ぶ
+   4. Client Name に `zoho CLI` と入れる。Homepage URL には
+      `https://github.com/sngymgt/cli/tree/main/zoho` を入れる（何を入れても動きは変わらない）
+   5. 「CREATE」を押す
+   6. 開いた画面の「Client Secret」タブに出る **Client ID** と **Client Secret** を、次の `zoho init` に貼る
+      （人には送らない。メモにも残さなくてよい。また要るときはここで見られる）
+
+   クライアントは自分の Zoho アカウントに結び付くので、アカウントが無効になれば一緒に使えなくなる。
+   自分のアカウントを持たず共有アカウントで操作している人だけ、共有アカウントの api-console にある
+   **CLI** を開いて同じタブから写す。
 2. `zoho init` が 2 つを訊くので貼る。`~/.config/zoho/env`（600）に入る。既にあれば何もしない
    （端末でないときは空の雛形を作る。Windows の Git Bash では作らずに止まる。データセンターは `ZOHO_DC=jp`）
 3. `zoho login` で表示される URL をブラウザで開いて承認する。既定は読むだけで、レコードを書くなら
