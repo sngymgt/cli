@@ -35,5 +35,10 @@ GWS_PROFILE=<name> gws ...      同上
   許可すれば、どのプロファイルの認証情報も復号できる。
   `gws auth logout` は当該 config dir のファイルを消すだけで鍵には触らないので、
   他のプロファイルは巻き添えにならない
+- 本体の `auth login` の選択画面は `cloud-platform` / `pubsub` に既定でチェックが入っている。
+  Workspace のアカウントでこれを許可すると Google Cloud のセッション制御の対象になり、
+  十数時間ごとに `invalid_rapt` で切れる。`<プロファイル>/scopes` に 1 行 1 スコープを書いておくと
+  `auth login` がそのスコープで認可する（短い名前は URL に展開する。本体の `--scopes` は展開しない）。
+  `--scopes` / `--services` / `--full` / `--readonly` を明示したときは使わない
 - `GOOGLE_WORKSPACE_CLI_{TOKEN,CREDENTIALS_FILE,CLIENT_ID,CLIENT_SECRET}` が設定されていると
   プロファイルより優先されるため、ラッパー側で解除して警告する

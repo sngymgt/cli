@@ -111,6 +111,36 @@ resolve_label() {
   printf '%s\n' "$email"
 }
 
+# 本体の選択画面は cloud-platform / pubsub に既定でチェックが入っている。これを許可すると
+# Google Cloud のセッション制御の対象になり、refresh token が十数時間で invalid_rapt になる。
+# 本体の --scopes は短い名前を展開せずそのまま送る（drive が無効なスコープになる）ので、ここで URL にする
+profile_scopes() {
+  local file="$1/scopes" line out=""
+  [ -f "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="$(printf '%s' "$line" | tr -d '[:space:]')"
+    [ -n "$line" ] || continue
+    case "$line" in
+      *://*|openid) ;;
+      *) line="https://www.googleapis.com/auth/$line" ;;
+    esac
+    out="${out:+$out,}$line"
+  done < "$file"
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+has_scope_flag() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --scopes|--scopes=*|--full|--readonly|-s|--services|--services=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 usage() {
   cat <<'USAGE'
 gws profile — gws の認証情報プロファイルを切り替える
@@ -122,6 +152,7 @@ gws profile — gws の認証情報プロファイルを切り替える
   gws profile add <name> [--client <client_secret.json>] [--no-login] [-- <auth login の引数>]
                                   プロファイルを作って gws auth login を実行
                                   --no-login なら箱だけ作る（auth setup を後で流すとき）
+                                  scopes ファイルは有効なプロファイルから複製する
   gws profile label <name> [text] 表示ラベルを設定（省略時は API で取得）
   gws profile path [name]         設定ディレクトリのパス
   gws profile rm <name> [-f]      プロファイルを削除
@@ -130,6 +161,10 @@ gws profile — gws の認証情報プロファイルを切り替える
   GWS_PROFILE=<name> gws ...      同上（--profile があればそちらが優先）
   GWS_PROFILE_ROOT=<dir>          プロファイル置き場（既定 ~/.config/gws-profiles）
   GWS_PROFILE_PASSTHROUGH=1       profile も本体に渡す（本体側の profile を使うとき）
+
+<プロファイル>/scopes に 1 行 1 スコープ（drive / gmail.modify などの短い名前か URL。# 以降は無視）を
+書いておくと、gws auth login は選択画面を出さずにそのスコープで認可する。
+--scopes / --services / --full / --readonly を付けたときは scopes ファイルを使わない。
 
 GOOGLE_WORKSPACE_CLI_{TOKEN,CREDENTIALS_FILE,CLIENT_ID,CLIENT_SECRET} は
 プロファイルより優先されてしまうため、設定されていれば解除して警告する。
@@ -209,6 +244,10 @@ cmd_profile() {
         echo "OAuth クライアントは '$seed' から複製しました"
       fi
       chmod 600 "$dir/client_secret.json" 2>/dev/null || true
+      if [ -f "$(profile_dir "$seed")/scopes" ]; then
+        cp "$(profile_dir "$seed")/scopes" "$dir/scopes"
+        echo "スコープは '$seed' から複製しました（$dir/scopes）"
+      fi
       # Discovery docs are account-independent and ~7MB, so share one copy.
       if [ -d "$(profile_dir "$seed")/cache" ] && [ ! -e "$dir/cache" ]; then
         ln -s "$(profile_dir "$seed")/cache" "$dir/cache"
@@ -220,6 +259,10 @@ cmd_profile() {
         exit 0
       fi
 
+      local scopes
+      if ! has_scope_flag ${login_args[@]+"${login_args[@]}"} && scopes="$(profile_scopes "$dir")"; then
+        login_args+=(--scopes "$scopes")
+      fi
       echo "ブラウザで '$name' としてログインします..."
       if GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$dir" "$real_gws" auth login ${login_args[@]+"${login_args[@]}"}; then
         local email
@@ -423,6 +466,13 @@ for _v in GOOGLE_WORKSPACE_CLI_TOKEN GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE \
     unset "$_v"
   fi
 done
+
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "login" ] && ! has_scope_flag "${@:3}"; then
+  if _scopes="$(profile_scopes "$config_dir")"; then
+    echo "gws: '$profile' の既定スコープで認可します（$config_dir/scopes）" >&2
+    set -- "$@" --scopes "$_scopes"
+  fi
+fi
 
 export GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$config_dir"
 exec "$real_gws" "$@"
