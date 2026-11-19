@@ -2,6 +2,7 @@
 """Zoho CRM API v8 CLI (OAuth 2.0 self client)."""
 
 import difflib
+import getpass
 import json
 import mimetypes
 import os
@@ -13,8 +14,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import webbrowser
 
-CONFIG_DIR = os.path.expanduser("~/.config/zoho")
+# 人用クライアントと Self Client を 1 台で使い分けるときは ZOHO_CONFIG_DIR で切り替える
+CONFIG_DIR = os.path.expanduser(os.environ.get("ZOHO_CONFIG_DIR") or "~/.config/zoho")
 ENV_PATH = os.path.join(CONFIG_DIR, "env")
 TOKENS_PATH = os.path.join(CONFIG_DIR, "tokens.json")
 
@@ -95,7 +98,7 @@ def save_tokens(tokens):
 
 def load_tokens():
     if not os.path.exists(TOKENS_PATH):
-        die("未認証です。`zoho auth <grant_token>` を実行してください")
+        die("未認証です。`zoho login` を実行してください（Self Client なら `zoho auth <grant_token>`）")
     with open(TOKENS_PATH) as f:
         return json.load(f)
 
@@ -145,6 +148,96 @@ def cmd_auth(env, args):
     print(f"ok: {TOKENS_PATH} に保存しました (api_domain={res.get('api_domain')})")
 
 
+# login の既定。書く人だけ --write か --scope で広げる
+READ_SCOPES = ",".join([
+    "ZohoCRM.modules.READ", "ZohoCRM.settings.READ", "ZohoCRM.users.READ",
+    "ZohoCRM.org.READ", "ZohoCRM.coql.READ", "ZohoCRM.bulk.READ",
+])
+WRITE_SCOPES = ",".join([
+    "ZohoCRM.modules.ALL", "ZohoCRM.settings.ALL", "ZohoCRM.users.READ",
+    "ZohoCRM.org.READ", "ZohoCRM.coql.READ", "ZohoCRM.bulk.ALL",
+])
+
+
+def post_device(url, params):
+    """デバイスフローは承認待ちを 4xx で返すことがあるので、HTTP の失敗でも JSON を読む。"""
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(params).encode(), method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=60) as res:
+            raw = res.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode(errors="replace")
+    except urllib.error.URLError as e:
+        die(f"Zoho に接続できません: {e.reason}")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        die(f"{url} -> JSON が返りませんでした: {raw[:300]}")
+
+
+def cmd_login(env, args):
+    scope = READ_SCOPES
+    write, args = take_flag(args, "--write")
+    if write:
+        scope = WRITE_SCOPES
+    values, args = take_values(args, "--scope")
+    if values:
+        scope = values[-1]
+    if args:
+        die("usage: zoho login [--write | --scope <scope,...>]")
+    base = env["ZOHO_ACCOUNTS_BASE"]
+    res = post_device(f"{base}/oauth/v3/device/code", {
+        "client_id": env["ZOHO_CLIENT_ID"],
+        "grant_type": "device_request",
+        "scope": scope,
+        "access_type": "offline",
+        # 同じユーザーで 2 回目以降も refresh_token を返させる
+        "prompt": "consent",
+    })
+    if "device_code" not in res:
+        die(f"承認の開始に失敗しました: {json.dumps(res, ensure_ascii=False)}"
+            "（client_id が Non-browser Applications のものか確かめてください）")
+    url = res.get("verification_uri_complete") or res.get("verification_url")
+    print(f"ブラウザで承認してください（コード: {res.get('user_code')}）\n  {url}", file=sys.stderr)
+    try:
+        webbrowser.open(url)
+    except Exception:                                       # noqa: BLE001
+        pass
+    # interval と expires_in はミリ秒で返る
+    interval = max(int(res.get("interval", 5000)) / 1000, 5)
+    deadline = time.time() + int(res.get("expires_in", 300000)) / 1000
+    while time.time() < deadline:
+        time.sleep(interval)
+        tok = post_device(f"{base}/oauth/v3/device/token", {
+            "client_id": env["ZOHO_CLIENT_ID"],
+            "client_secret": env["ZOHO_CLIENT_SECRET"],
+            "grant_type": "device_token",
+            "code": res["device_code"],
+        })
+        err = tok.get("error")
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval += 5
+            continue
+        if err == "other_dc":
+            die(f"Zoho のユーザーが別のデータセンターです（{tok.get('user_location')}）。ZOHO_DC を直してください")
+        if err:
+            die(f"承認されませんでした（{err}）")
+        if "refresh_token" not in tok:
+            die(f"refresh_token が返りませんでした（返ったキー: {', '.join(tok)}）")
+        save_tokens({
+            "access_token": tok["access_token"],
+            "refresh_token": tok["refresh_token"],
+            "expires_at": time.time() + int(tok.get("expires_in", 3600)),
+            "api_domain": tok.get("api_domain", env["ZOHO_API_BASE"]),
+        })
+        print(f"ok: {TOKENS_PATH} に保存しました (scope={scope})")
+        return
+    die("承認の期限（5 分）が切れました。もう一度 `zoho login` を実行してください")
+
+
 def cmd_revoke(env, args):
     opts = [a for a in args if a in ("-y", "--yes")]
     args = [a for a in args if a not in ("-y", "--yes")]
@@ -155,10 +248,10 @@ def cmd_revoke(env, args):
     if not token:
         die("トークンが空です")
     stored = json.load(open(TOKENS_PATH)).get("refresh_token") if os.path.exists(TOKENS_PATH) else None
-    # tokens.json と同じ値が Secret Manager（zoho-connector）にも入っていて、毎朝のジョブが読む
+    # 同じ値を手元以外（サーバーのジョブなど）に入れていると、そちらも止まる
     if token == stored and not opts:
-        die("これは今 tokens.json で使っている refresh_token です。失効させるとコネクタも"
-            "止まります。分かったうえで消すなら -y を付けてください")
+        die("これは今 tokens.json で使っている refresh_token です。同じ値を他で使っていれば"
+            "そちらも止まります。分かったうえで消すなら -y を付けてください")
     # 失敗時のエラーに URL を出すと token が端末に残るので、post_form は使わない
     url = f"{env['ZOHO_ACCOUNTS_BASE']}/oauth/v2/token/revoke?" + urllib.parse.urlencode({"token": token})
     req = urllib.request.Request(url, data=b"", method="POST")
@@ -667,21 +760,34 @@ def cmd_init():
         secure(ENV_PATH, 0o600)
         print(f"既に {ENV_PATH} があります")
         return
+    client_id = client_secret = ""
+    if sys.stdin.isatty():
+        print("https://api-console.zoho.jp/ の Non-browser Applications のクライアントの値を入れてください"
+              "（Client Secret タブ）", file=sys.stderr)
+        client_id = input("Client ID: ").strip()
+        client_secret = getpass.getpass("Client Secret（表示されません）: ").strip()
+        if not client_id or not client_secret:
+            die("Client ID と Client Secret の両方が要ります")
     # exists と open("w") を分けると、その隙に作られた env を切り詰めて
     # client_secret を失う。O_EXCL で名前の確保ごと不可分にする
     fd = os.open(ENV_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(
-            "# https://api-console.zoho.jp/ の Self Client で発行した値\n"
-            "ZOHO_CLIENT_ID=\n"
-            "ZOHO_CLIENT_SECRET=\n"
+            "# https://api-console.zoho.jp/ で発行した値（人は Non-browser Applications のクライアント）\n"
+            f"ZOHO_CLIENT_ID={client_id}\n"
+            f"ZOHO_CLIENT_SECRET={client_secret}\n"
             "ZOHO_DC=jp\n"
         )
-    print(f"{ENV_PATH} を作成しました。CLIENT_ID / CLIENT_SECRET を記入してください")
+    if client_id:
+        print(f"{ENV_PATH} を作成しました。続けて `zoho login` を実行してください")
+    else:
+        print(f"{ENV_PATH} を作成しました。CLIENT_ID / CLIENT_SECRET を記入してください")
 
 
 USAGE = """usage:
   zoho init                              設定ファイルの雛形を作る
+  zoho login [--write | --scope <s,...>] ブラウザで承認して保存（Non-browser Applications の
+                                         クライアント。既定は読むだけ、--write で書き込みも）
   zoho auth <grant_token>                Self Client の grant token を交換して保存
   zoho revoke <refresh_token | ->        refresh_token を 1 本失効させる (- は標準入力。
                                          tokens.json の分は -y が要る)
@@ -714,7 +820,9 @@ def main():
         cmd_init()
         return
     env = load_env()
-    if cmd == "auth":
+    if cmd == "login":
+        cmd_login(env, args)
+    elif cmd == "auth":
         cmd_auth(env, args)
     elif cmd == "revoke":
         cmd_revoke(env, args)

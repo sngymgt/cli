@@ -22,13 +22,31 @@ Zoho CRM API v8 を直接叩く CLI。MCP では届かない操作（項目の�
 
 ## セットアップ
 
-1. `zoho init` で `~/.config/zoho/env` の雛形を作る
-2. <https://api-console.zoho.jp/> の **Self Client** で client_id / client_secret を発行して記入する
-   （データセンターが jp なら `ZOHO_DC=jp`。accounts は `accounts.zoho.jp`、API は `zohoapis.jp`）
-3. 同じ Self Client 画面で scope を指定して grant token を作り、`zoho auth <grant_token>` で交換する
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/sngymgt/cli/main/zoho/zoho -o ~/.local/bin/zoho
+chmod +x ~/.local/bin/zoho
+zoho init
+```
+
+1. Client ID / Client Secret を手に入れる
+   1. ブラウザで共有アカウントとして Zoho にログインした状態で <https://api-console.zoho.jp/> を開く
+   2. クライアントの一覧から **CLI**（Non-browser Applications）を開く
+   3. 「Client Secret」タブに出る Client ID と Client Secret を、次の `zoho init` に貼る
+      （人には送らない。ログインできる人は各自でここから写す）
+2. `zoho init` が 2 つを訊くので貼る。`~/.config/zoho/env`（600）に入る。既にあれば何もしない
+   （端末でないときは空の雛形を作る。データセンターは `ZOHO_DC=jp`）
+3. `zoho login` で表示される URL をブラウザで開いて承認する。既定は読むだけで、書き込みも要るなら
+   `zoho login --write`
+
+**サーバーのジョブと同じクライアントを人に配らない。** Zoho の refresh_token は同じクライアント・
+同じユーザーで 20 本までで、超えると使用中でも一番古いものが消える。人が `login` を繰り返して
+ジョブのトークンを押し出さないよう、ジョブは Self Client、人は Non-browser Applications と分ける。
+Self Client の grant token は `zoho auth <grant_token>` で交換する。
 
 トークンは `~/.config/zoho/tokens.json`（600）に入り、失効時は refresh token で自動更新される。
-`zoho token` で状態を確認できる。
+`zoho token` で状態を確認できる。1 台で 2 つのクライアントを使い分けるときは `ZOHO_CONFIG_DIR` で
+設定ディレクトリを切り替える。
 
 ## 注意
 
