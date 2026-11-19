@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Slack を利用者として読むための CLI（read-only）。ワークスペースはプロファイルで切り替える。
+"""Slack を利用者として読むための CLI。ワークスペースはプロファイルで切り替える。
+書き込みは、許可リストに載せたチャンネルへの投稿だけ。
 
 知らないと必ず一度踏む Slack 側の癖:
 
@@ -7,18 +8,23 @@
 - conversations.history / replies の「15 件・1 req/分」制限は配布アプリ向けで、ワークスペース
   内製アプリは対象外（1000 件・50+ req/分）。**アプリの Distribution を有効にした瞬間に履歴
   取得が実用外になる**ので有効にしないこと。
-- HTTP メソッドは読み書きの境界にならない（chat.postMessage も GET で通る）。read-only を
-  守っているのは READ_METHODS の allowlist と、manifest が書き込み scope を要求しないことの
-  2 点だけで、どちらかを外すと CLI は黙って書けるようになる。
+- HTTP メソッドは読み書きの境界にならない（chat.postMessage も GET で通る）。読み取りの門は
+  READ_METHODS（call() と slk api が通る）、書き込みの門は WRITE_METHODS（write_call() だけが
+  通る）で、この 2 つの表が境界のすべて。READ_METHODS に書き込みを入れると slk api から
+  任意の宛先へ書けるようになる。
   例外は oauth.v2.access ひとつで、これはワークスペースのデータを読まずトークンを発行する
   だけなので allowlist を通さない（通す枠に入れると、そこが読み取り以外の入口になる）。
+- user token の chat:write はチャンネル単位に絞れない（参加している所ならどこへでも書ける）。
+  宛先を絞っているのはプロファイルごとの writable.json だけで、既定は空＝どこにも書けない。
+  照合は ID で行う。名前は改名されると別のチャンネルを指す。
 - 検索も履歴もトークンの持ち主に見える範囲しか返さない。0 件は「無い」ではなく「見えていない」
   かもしれない。フリープランでは 90 日より古いメッセージがどちらにも出ない。
 - ユーザー ID / チャンネル ID はワークスペース内でしか意味を持たない。キャッシュをプロファイル
   間で共有すると、エラーにならず別人の名前で表示される。
-- Keychain の項目は (service, account) だけが鍵で、SLK_CONFIG_DIR は鍵に入らない。別の設定
-  ディレクトリでも**同名プロファイルなら同じトークンを引く**ので、試験用の設定ディレクトリを
-  作るときは SLK_KEYCHAIN_SERVICE も一緒に変えること。
+- 資格情報ストア（Keychain / Windows 資格情報マネージャー）の項目は (service, account) だけが
+  鍵で、SLK_CONFIG_DIR は鍵に入らない。別の設定ディレクトリでも**同名プロファイルなら同じ
+  トークンを引く**ので、試験用の設定ディレクトリを作るときは SLK_KEYCHAIN_SERVICE も一緒に
+  変えること。
 - conversations.history は latest から過去へ向かってしか読めない。ある時刻より後ろの N 件は
   窓を広げて「窓の中を全部取り切った」状態を作ってから先頭を取る（messages_after）。
 - assistant.search.context は AI 向けを謳っているが実際はキーワード一致で、文章を丸ごと投げると
@@ -51,6 +57,7 @@ KEYCHAIN_SERVICE = os.environ.get("SLK_KEYCHAIN_SERVICE") or "slk"
 # client_secret はプロファイルではなくアプリのものなので、専用の account に置く。
 # client_id ごとに分けるのは、別アプリに切り替えたときに前の secret を掴まないため
 APP_SECRET_PREFIX = "__app__"
+STORE_LABEL = "Windows 資格情報マネージャー" if os.name == "nt" else "Keychain"
 # この error が返ったら secret 側の問題なので、入力し直して 1 度だけやり直す
 BAD_SECRET_ERRORS = ("invalid_client_id", "bad_client_secret",
                      "invalid_client_secret", "client_secret_missing")
@@ -104,6 +111,23 @@ USER_SCOPES = [
     "search:read.public", "search:read.private", "search:read.im",
     "search:read.mpim", "search:read.files", "search:read.users",
 ]
+
+# 書き込みの門。slk api は READ_METHODS しか見ないので、ここに足しても slk api からは呼べない
+WRITE_METHODS = {
+    "chat.postMessage": "POST",
+}
+
+# login --write / manifest --write のときだけ要求する
+WRITE_SCOPES = ["chat:write"]
+
+TS_RE = re.compile(r"^\d{9,10}\.\d{6}$")
+
+# Windows の os.open は既定がテキストモードで、書いた \n が \r\n に化ける（ダウンロードした
+# バイナリが壊れる）。open() は内部で付けているが、os.open では自分で付けるしかない
+O_BINARY = getattr(os, "O_BINARY", 0)
+
+WRITABLE_NOTE = ("投稿を許可した宛先（ID: 登録時の名前）。AI エージェントはこのファイルを編集しないこと。"
+                 "追加は利用者に確認したうえで slk writable add を使う（利用者の確認を挟む）")
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ID_RE = re.compile(r"^[CDGU][A-Z0-9]{6,}$")
@@ -296,6 +320,51 @@ def call(token, method, params=None, _verb=None, _tries=0):
     die(f"{method} -> {err}" + (f"（{hints[err]}）" if err in hints else ""))
 
 
+def write_call(prof, method, params):
+    """書き込みの唯一の入口。宛先が writable.json に無ければ API を呼ばない。
+
+    再試行は 429 だけ。429 は Slack が受け付けずに返すので送り直してよいが、それ以外の
+    失敗（特に送信後のタイムアウト）は届いたかどうか分からず、送り直すと二重に投稿される。"""
+    if method not in WRITE_METHODS:
+        die(f"{method} は書き込みの allowlist にありません")
+    prof.require_writable(params.get("channel"))
+    for tries in range(MAX_RETRY + 1):
+        try:
+            res = _http(method, WRITE_METHODS[method], prof.token, params)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and tries < MAX_RETRY:
+                try:
+                    delay = int(e.headers.get("Retry-After") or 30)
+                except ValueError:
+                    delay = 30
+                delay = max(1, min(delay, 120))
+                warn(f"{method}: レート制限。{delay}s 待って再試行します")
+                time.sleep(delay + 1)
+                continue
+            die(f"{method} -> HTTP {e.code} {e.read().decode()[:500]}")
+        except OSError as e:
+            die(f"{method} -> 通信に失敗しました: {getattr(e, 'reason', e)}\n"
+                "    届いたかどうかは分かりません。slk history で確かめてから送り直してください")
+    if res.get("ok"):
+        return res
+    err = res.get("error", "?")
+    if err == "missing_scope":
+        die(f"{method}: このトークンには書き込みの権限がありません（必要={res.get('needed')}）\n"
+            "    アプリの User Token Scopes に chat:write を足してから slk login --write で取り直してください")
+    hints = {
+        "not_in_channel": "そのチャンネルに参加していないので書けません",
+        "channel_not_found": "チャンネルが見つかりません（参加していない非公開チャンネルもこうなる）",
+        "is_archived": "アーカイブ済みのチャンネルです",
+        "msg_too_long": "本文が長すぎます",
+        "no_text": "本文が空です",
+        "restricted_action": "ワークスペースの設定で投稿が制限されています",
+        "invalid_auth": "トークンが無効です（slk login でやり直す）",
+        "token_expired": "トークンの期限が切れています（slk login でやり直す）",
+    }
+    die(f"{method} -> {err}" + (f"（{hints[err]}）" if err in hints else ""))
+
+
 # --- profile ----------------------------------------------------------------
 
 def keychain_ok():
@@ -327,11 +396,140 @@ def keychain_del(name):
                    capture_output=True)
 
 
+def wincred_ok():
+    return os.name == "nt"
+
+
+def _wincred():
+    """Windows の資格情報マネージャー（advapi32）を ctypes で。jamroll-cli の jr と同じ実装。
+
+    ctypes.wintypes は Windows でしか import できないので、ここで遅延して読む。
+    モジュールの先頭に上げると macOS で slk 自体が起動しなくなる。"""
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                    ("dwHighDateTime", wintypes.DWORD)]
+
+    class CREDENTIAL(ctypes.Structure):
+        _fields_ = [("Flags", wintypes.DWORD),
+                    ("Type", wintypes.DWORD),
+                    ("TargetName", wintypes.LPWSTR),
+                    ("Comment", wintypes.LPWSTR),
+                    ("LastWritten", FILETIME),
+                    ("CredentialBlobSize", wintypes.DWORD),
+                    ("CredentialBlob", ctypes.POINTER(ctypes.c_char)),
+                    ("Persist", wintypes.DWORD),
+                    ("AttributeCount", wintypes.DWORD),
+                    ("Attributes", ctypes.c_void_p),
+                    ("TargetAlias", wintypes.LPWSTR),
+                    ("UserName", wintypes.LPWSTR)]
+
+    advapi32.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.POINTER(ctypes.POINTER(CREDENTIAL))]
+    advapi32.CredReadW.restype = wintypes.BOOL
+    advapi32.CredWriteW.argtypes = [ctypes.POINTER(CREDENTIAL), wintypes.DWORD]
+    advapi32.CredWriteW.restype = wintypes.BOOL
+    advapi32.CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
+    advapi32.CredDeleteW.restype = wintypes.BOOL
+    advapi32.CredFree.argtypes = [ctypes.c_void_p]
+    advapi32.CredFree.restype = None
+    return ctypes, advapi32, CREDENTIAL
+
+
+def _wincred_target(name):
+    # Keychain の (service, account) に揃える。SLK_KEYCHAIN_SERVICE を変えれば試験用に分かれる
+    return f"{KEYCHAIN_SERVICE}:{name}"
+
+
+def wincred_get(name):
+    try:
+        ctypes, advapi32, CREDENTIAL = _wincred()
+        ptr = ctypes.POINTER(CREDENTIAL)()
+        if not advapi32.CredReadW(_wincred_target(name), 1, 0, ctypes.byref(ptr)):
+            return None
+        try:
+            c = ptr.contents
+            raw = ctypes.string_at(c.CredentialBlob, c.CredentialBlobSize)
+            return raw.decode("utf-16-le") or None
+        finally:
+            advapi32.CredFree(ptr)
+    except Exception:
+        return None
+
+
+def wincred_set(name, secret):
+    try:
+        ctypes, advapi32, CREDENTIAL = _wincred()
+        blob = secret.encode("utf-16-le")
+        c = CREDENTIAL()
+        c.Type = 1                      # CRED_TYPE_GENERIC
+        c.TargetName = _wincred_target(name)
+        c.CredentialBlobSize = len(blob)
+        c.CredentialBlob = ctypes.cast(ctypes.create_string_buffer(blob, len(blob)),
+                                       ctypes.POINTER(ctypes.c_char))
+        c.Persist = 2                   # CRED_PERSIST_LOCAL_MACHINE
+        c.UserName = name
+        if not advapi32.CredWriteW(ctypes.byref(c), 0):
+            return False, f"CredWriteW が失敗しました（{ctypes.get_last_error()}）"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def wincred_del(name):
+    try:
+        _, advapi32, _ = _wincred()
+        advapi32.CredDeleteW(_wincred_target(name), 1, 0)
+    except Exception:
+        pass
+
+
+# 資格情報ストア: macOS は Keychain、Windows は資格情報マネージャー。どちらも無ければ
+# store_ok() が偽で、トークンは env ファイルに平文で置かれる
+
+def store_ok():
+    return keychain_ok() or wincred_ok()
+
+
+def store_get(name):
+    if keychain_ok():
+        return keychain_get(name)
+    if wincred_ok():
+        return wincred_get(name)
+    return None
+
+
+def store_set(name, secret):
+    if keychain_ok():
+        return keychain_set(name, secret)
+    if wincred_ok():
+        return wincred_set(name, secret)
+    return False, "この OS では資格情報ストアを使えません"
+
+
+def store_del(name):
+    if keychain_ok():
+        keychain_del(name)
+    elif wincred_ok():
+        wincred_del(name)
+
+
+def store_where(name):
+    """人に見せる置き場所。Keychain は (service, account)、資格情報マネージャーはターゲット名で探す。"""
+    if wincred_ok() and not keychain_ok():
+        return f"{STORE_LABEL}（{_wincred_target(name)}）"
+    return f"{STORE_LABEL}（service={KEYCHAIN_SERVICE} / account={name}）"
+
+
 def file_token(dir_):
     path = os.path.join(dir_, "env")
     if not os.path.exists(path):
         return None
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line.startswith("SLACK_USER_TOKEN="):
@@ -343,7 +541,7 @@ def file_token(dir_):
 
 def token_where(name):
     """そのプロファイルのトークンがどこにあるか。None なら未認証。"""
-    if keychain_ok() and keychain_get(name):
+    if store_ok() and store_get(name):
         return "keychain"
     if file_token(os.path.join(PROFILE_ROOT, name)):
         return "file"
@@ -352,10 +550,9 @@ def token_where(name):
 
 def write_env_stub(dir_):
     path = os.path.join(dir_, "env")
-    fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(f"# トークンは macOS Keychain にあります"
-                f"（service={KEYCHAIN_SERVICE} / account={os.path.basename(dir_)}）\n")
+    fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | O_BINARY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"# トークンは {store_where(os.path.basename(dir_))} にあります\n")
 
 
 def profile_dir(name):
@@ -376,7 +573,7 @@ def active_name():
         if src:
             return src
     if os.path.exists(ACTIVE_FILE):
-        with open(ACTIVE_FILE) as f:
+        with open(ACTIVE_FILE, encoding="utf-8") as f:
             name = f.readline().strip()
         if name:
             return name
@@ -402,9 +599,9 @@ class Profile:
     @property
     def token(self):
         if self._token is None:
-            self._token = (keychain_get(self.name) if keychain_ok() else None) or file_token(self.dir)
+            self._token = (store_get(self.name) if store_ok() else None) or file_token(self.dir)
             if not self._token:
-                die(f"プロファイル '{self.name}' のトークンが Keychain にも "
+                die(f"プロファイル '{self.name}' のトークンが {STORE_LABEL} にも "
                     f"{os.path.join(self.dir, 'env')} にもありません"
                     f"（slk profile add {self.name} で登録）")
         return self._token
@@ -415,7 +612,7 @@ class Profile:
     def team(self):
         if self._team is None:
             path = os.path.join(self.dir, "team.json")
-            self._team = json.load(open(path)) if os.path.exists(path) else {}
+            self._team = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
         return self._team
 
     def domain(self):
@@ -427,6 +624,48 @@ class Profile:
         t = self.team()
         who = t.get("user") or "?"
         note(f"workspace: {self.name} ({t.get('team', '?')} / {who})")
+
+    # --- 書き込みの許可リスト（{チャンネル ID: 登録時の表示名}）
+    def _writable_path(self):
+        return os.path.join(self.dir, "writable.json")
+
+    def writable(self):
+        path = self._writable_path()
+        if not os.path.exists(path):
+            return {}
+        try:
+            blob = json.load(open(path, encoding="utf-8"))
+        except ValueError as e:
+            # 空とみなすと「全部消えた」のか「壊れた」のか区別できないので、黙って進まない
+            die(f"{path} が JSON として読めません: {e}")
+        chans = blob.get("channels") if isinstance(blob, dict) else None
+        if not isinstance(chans, dict):
+            die(f"{path} の形が違います（{{\"channels\": {{\"C…\": \"#name\"}}}}）")
+        return chans
+
+    def save_writable(self, chans):
+        path = self._writable_path()
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | O_BINARY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"_note": WRITABLE_NOTE, "channels": chans}, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+
+    def require_writable(self, cid):
+        if cid and cid in self.writable():
+            return
+        if not cid:
+            die("宛先がありません")
+        name = self.display_channel(cid)
+        # 実際に読むのは AI エージェントなので、次の一手をここで指示する。勝手に
+        # writable add を叩いても人の確認で止まるが、先に利用者へ聞くのが正しい流れ
+        die(f"{name} ({cid}) は書き込みの許可リストにありません（プロファイル: {self.name}）\n"
+            f"    AI エージェントへ: 許可リストへの追加は利用者本人の同意が要ります。自分の判断で\n"
+            f"    追加せず、利用者に「{name} は投稿を許可したチャンネルにありません。追加しますか？」と\n"
+            f"    確認してください。同意を得たら `slk writable add {cid}` を実行します（利用者の画面に\n"
+            f"    確認ダイアログが出るので、そこで許可してもらうよう伝える）。writable.json を\n"
+            f"    直接編集しないこと。")
 
     # --- cache
     def _cache_path(self, kind):
@@ -445,7 +684,7 @@ class Profile:
         if not os.path.exists(path):
             return {"ts": 0, "items": {}}
         try:
-            blob = json.load(open(path))
+            blob = json.load(open(path, encoding="utf-8"))
         except ValueError:
             return {"ts": 0, "items": {}}
         blob.setdefault("ts", 0)
@@ -456,8 +695,8 @@ class Profile:
         path = self._cache_path(kind)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
-        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w") as f:
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | O_BINARY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(blob, f, ensure_ascii=False)
         os.replace(tmp, path)
 
@@ -547,7 +786,8 @@ class Profile:
         return "#" + (row.get("name") or cid)
 
     # --- 解決
-    def resolve_user(self, spec):
+    def resolve_user(self, spec, exact=False):
+        want_exact = exact
         if ID_RE.match(spec):
             return spec
         # 先頭の @ は Slack のハンドル表記なので、それを除いた残りに @ がある時だけ
@@ -562,7 +802,9 @@ class Profile:
             return exact[0]
         if len(exact) > 1:
             die("複数のユーザーが一致します: " + ", ".join(items[u]["name"] for u in exact[:10]))
-        part = [uid for uid, r in items.items() if not r.get("deleted")
+        if want_exact:
+            die(f"名前が完全に一致するユーザーがいません: {spec}（slk users で確認）")
+        part =[uid for uid, r in items.items() if not r.get("deleted")
                 and (needle in str(r.get("name", "")).lower() or needle in str(r.get("real", "")).lower())]
         if len(part) == 1:
             return part[0]
@@ -570,20 +812,25 @@ class Profile:
             die(f"ユーザーが見つかりません: {spec}")
         die("複数のユーザーが一致します: " + ", ".join(items[u]["name"] for u in part[:10]))
 
-    def resolve_channel(self, spec):
+    def resolve_channel(self, spec, exact=False):
+        """exact は書き込み用。部分一致で 1 件に絞れても、打ち間違いが別のチャンネルに当たる。"""
         if ID_RE.match(spec):
             return spec
         if spec.startswith("@"):
-            uid = self.resolve_user(spec)
+            uid = self.resolve_user(spec, exact=exact)
             for cid, r in self.channel_index().items():
                 if r.get("type") == "im" and r.get("user") == uid:
                     return cid
             die(f"{spec} との DM が見つかりません")
         needle = spec.lstrip("#").lower()
         items = self.channel_index()
-        exact = [cid for cid, r in items.items() if str(r.get("name", "")).lower() == needle]
-        if len(exact) == 1:
-            return exact[0]
+        hits = [cid for cid, r in items.items() if str(r.get("name", "")).lower() == needle]
+        if len(hits) == 1:
+            return hits[0]
+        if exact:
+            if hits:
+                die("同名のチャンネルが複数あります。ID で指定してください: " + ", ".join(hits[:10]))
+            die(f"名前が完全に一致するチャンネルがありません: {spec}（slk channels で確認）")
         part = [cid for cid, r in items.items() if needle in str(r.get("name", "")).lower()]
         if len(part) == 1:
             note(f"'{spec}' → {self.display_channel(part[0])}")
@@ -874,7 +1121,7 @@ def cmd_file(prof, args):
         try:
             # 添付は機微なので --force 経路（mkstemp は 0600）と権限を揃える。
             # open("xb") のままだと umask 次第で他人に読める
-            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY | O_BINARY, 0o600)
         except FileExistsError:
             die(f"既にあります: {dest}（上書きするなら --force）")
         try:
@@ -1290,6 +1537,180 @@ def cmd_api(prof, args):
     out_json({key: rows, "count": len(rows)})
 
 
+# --- 書き込み ------------------------------------------------------------------
+
+def slack_escape(text):
+    """& < > だけを実体参照にする。そのまま送ると <!channel> や <@U…> が通知として効く。"""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def human_consent(message):
+    """人にしか答えられない確認。端末ならその場で聞き、端末が無ければ macOS のダイアログを出す。
+
+    AI エージェントは端末を持たずダイアログも押せないので、ここが許可リストを広げる操作の
+    実質的な門になる。--yes や環境変数で飛ばせるようにすると、AI の判断だけで宛先が増える。"""
+    if sys.stdin.isatty():
+        print(message, file=sys.stderr)
+        return input("許可しますか? [y/N] ").strip().lower() in ("y", "yes")
+    shown = "利用者の画面に確認ダイアログを出しました。利用者が答えるまで戻りません"
+    if sys.platform == "win32":
+        note(shown)
+        import ctypes
+        # MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2（既定は「いいえ」）| MB_SETFOREGROUND | MB_TOPMOST
+        flags = 0x4 | 0x30 | 0x100 | 0x10000 | 0x40000
+        return ctypes.windll.user32.MessageBoxW(None, message, "slk", flags) == 6   # IDYES
+    if shutil.which("osascript"):
+        note(shown)
+        return _consent_macos(message)
+    if shutil.which("zenity") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        note(shown)
+        # --no-markup が無いとチャンネル名の < & が Pango のマークアップとして解釈される
+        res = subprocess.run(["zenity", "--question", "--title=slk", "--no-markup", "--timeout=120",
+                              "--ok-label=許可する", "--cancel-label=許可しない", "--default-cancel",
+                              f"--text={message}"], capture_output=True)
+        return res.returncode == 0
+    die("端末でもダイアログを出せる環境でもないので、利用者の同意を確かめられません\n"
+        "    利用者が自分の端末で slk writable add を実行してください")
+
+
+def _consent_macos(message):
+    # 文言は argv で渡す。スクリプトに埋め込むと、チャンネル名の " で AppleScript が組み変わる
+    script = ['on run argv',
+              'display dialog (item 1 of argv) with title "slk" buttons {"許可しない", "許可する"} '
+              'default button "許可しない" cancel button "許可しない" with icon caution '
+              'giving up after 120',
+              'end run']
+    cmd = ["osascript"]
+    for line in script:
+        cmd += ["-e", line]
+    res = subprocess.run(cmd + [message], capture_output=True, text=True)
+    return res.returncode == 0 and "button returned:許可する" in res.stdout \
+        and "gave up:true" not in res.stdout
+
+
+def cmd_writable(prof, args):
+    sub = args[0] if args else "list"
+    rest = args[1:]
+    chans = prof.writable()
+    if sub in ("list", "ls"):
+        if not human():
+            out_json({"profile": prof.name, "channels": chans})
+            return
+        if not chans:
+            note(f"{prof.name}: 書き込める宛先はありません（slk writable add <#channel>）")
+            return
+        for cid, name in chans.items():
+            print(f"{cid}\t{name}")
+        return
+    if sub == "add":
+        if not rest:
+            die("usage: slk writable add <#channel|@user|C…> ...")
+        new = {}
+        for spec in rest:
+            if spec.startswith("-"):
+                die(f"不明なオプション: {spec}（add は利用者の確認を省略できません）")
+            cid = prof.resolve_channel(spec, exact=True)
+            if cid not in chans:
+                new[cid] = prof.channel_name(cid)
+        if not new:
+            note("すべて登録済みです")
+            return
+        team = prof.team().get("team") or prof.name
+        lines = "\n".join(f"  {n} ({c})" for c, n in new.items())
+        if not human_consent(f"{team} で、次の宛先への投稿を許可しますか？\n\n{lines}"):
+            die("追加しませんでした（利用者が許可していません）")
+        chans.update(new)
+        prof.save_writable(chans)
+        for cid, name in new.items():
+            print(f"追加: {name} ({cid})")
+        return
+    if sub in ("rm", "remove"):
+        if not rest:
+            die("usage: slk writable rm <#channel|@user|C…> ...")
+        for spec in rest:
+            # 改名・アーカイブ後でも外せるよう、まず登録時の ID と名前で探す
+            hit = spec if spec in chans else next(
+                (c for c, n in chans.items() if n.lower() == spec.lower()
+                 or n.lstrip("#@").lower() == spec.lstrip("#@").lower()), None)
+            if hit is None:
+                hit = prof.resolve_channel(spec, exact=True)
+            if hit not in chans:
+                die(f"許可リストにありません: {spec}")
+            print(f"削除: {chans.pop(hit)} ({hit})")
+        prof.save_writable(chans)
+        return
+    die("usage: slk writable [list|add|rm] ...")
+
+
+def cmd_post(prof, args):
+    opts, rest = take_opts(args, {"--thread": True, "--yes": False, "-y": False,
+                                  "--no-escape": False})
+    usage = ("usage: slk post <#channel|@user|C…|permalink> [本文|-] [--thread <ts|permalink>] "
+             "[--yes] [--no-escape]")
+    if not rest or len(rest) > 2:
+        die(usage + ("\n    本文は 1 つの引数にまとめてください（引用符で囲む）" if len(rest) > 2 else ""))
+    target, body = rest[0], (rest[1] if len(rest) > 1 else "-")
+
+    parsed = parse_url(target)
+    thread = None
+    if parsed:
+        cid, ts, thread_ts = parsed
+        thread = thread_ts or ts
+    else:
+        cid = prof.resolve_channel(target, exact=True)
+    if opts.get("--thread"):
+        if thread:
+            die("permalink を宛先にしたときは --thread を付けません（そのスレッドに返信します）")
+        t = opts["--thread"]
+        p = parse_url(t)
+        if p:
+            if p[0] != cid:
+                die("--thread の permalink が宛先と別のチャンネルです")
+            thread = p[2] or p[1]
+        elif TS_RE.match(t):
+            thread = t
+        else:
+            die(f"--thread には ts（1234567890.123456）か permalink を渡してください: {t}")
+    # 本文を組み立てる前に止める。標準入力を読み切ってから断ると、パイプの元が無駄になる
+    prof.require_writable(cid)
+
+    if body == "-":
+        if sys.stdin.isatty():
+            die(usage + "\n    本文を引数か標準入力で渡してください")
+        body = sys.stdin.read()
+    text = body.rstrip("\n")
+    if not text.strip():
+        die("本文が空です")
+    if not opts.get("--no-escape"):
+        text = slack_escape(text)
+
+    name = prof.display_channel(cid)
+    if not (opts.get("--yes") or opts.get("-y")):
+        if not sys.stdin.isatty():
+            die("確認できない環境です（内容を確かめたうえで --yes を付けてください）")
+        where = f"{name} ({cid})" + (f" のスレッド {thread}" if thread else "")
+        print(f"宛先: {where}  [workspace: {prof.name}]", file=sys.stderr)
+        for line in body.rstrip("\n").splitlines():
+            print(f"  | {line}", file=sys.stderr)
+        if input("投稿しますか? [y/N] ").strip().lower() not in ("y", "yes"):
+            die("中止しました")
+
+    params = {"channel": cid, "text": text}
+    if thread:
+        params["thread_ts"] = thread
+    res = write_call(prof, "chat.postMessage", params)
+    if G.get("--raw"):
+        out_json(res)
+        return
+    ts = res.get("ts")
+    link = prof.permalink(cid, ts, thread)
+    if G.get("--json"):
+        out_json({"channel": cid, "name": name, "ts": ts, "thread_ts": thread, "permalink": link})
+        return
+    note(f"投稿しました: {name}")
+    print(link)
+
+
 # --- profile / setup --------------------------------------------------------
 
 def save_team(dir_, auth):
@@ -1299,7 +1720,7 @@ def save_team(dir_, auth):
         domain = m.group(1)
     blob = {"team": auth.get("team"), "team_id": auth.get("team_id"), "domain": domain,
             "user": auth.get("user"), "user_id": auth.get("user_id")}
-    with open(os.path.join(dir_, "team.json"), "w") as f:
+    with open(os.path.join(dir_, "team.json"), "w", encoding="utf-8") as f:
         json.dump(blob, f, ensure_ascii=False, indent=2)
     return blob
 
@@ -1308,7 +1729,7 @@ def save_team(dir_, auth):
 
 def _peek(path):
     try:
-        return json.load(open(path))
+        return json.load(open(path, encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
@@ -1324,7 +1745,7 @@ def load_app():
         if not os.path.exists(path):
             continue
         try:
-            blob = json.load(open(path))
+            blob = json.load(open(path, encoding="utf-8"))
         except ValueError as e:
             die(f"{path} が JSON として読めません: {e}")
         if blob.get("client_id") and blob.get("redirect_uri"):
@@ -1346,21 +1767,21 @@ def secret_account(app):
 def app_secret(app, reset=False):
     acct = secret_account(app)
     if not reset:
-        sec = keychain_get(acct) if keychain_ok() else None
+        sec = store_get(acct) if store_ok() else None
         if sec:
             return sec
     if not sys.stdin.isatty():
-        die(f"client_secret が Keychain（account={acct}）にありません。"
+        die(f"client_secret が {STORE_LABEL}（account={acct}）にありません。"
             "対話環境で slk login を 1 度実行してください")
-    note("アプリの client_secret を登録します（Keychain に入り、次回から聞きません）")
+    note(f"アプリの client_secret を登録します（{STORE_LABEL} に入り、次回から聞きません）")
     note("入れ直したいときは slk login --reset-secret")
     sec = getpass.getpass("client_secret: ").strip()
     if not sec:
         die("client_secret が空です")
-    if keychain_ok():
-        ok, err = keychain_set(acct, sec)
+    if store_ok():
+        ok, err = store_set(acct, sec)
         if not ok:
-            warn(f"Keychain に保存できませんでした（今回だけ使います）: {err}")
+            warn(f"{STORE_LABEL} に保存できませんでした（今回だけ使います）: {err}")
     return sec
 
 
@@ -1378,10 +1799,10 @@ def oauth_exchange(app, secret, code):
         die(f"oauth.v2.access -> HTTP {e.code} {e.read().decode()[:300]}")
     if not blob.get("ok"):
         return None, blob.get("error", "?")
-    token = (blob.get("authed_user") or {}).get("access_token")
-    if not token:
+    authed = blob.get("authed_user") or {}
+    if not authed.get("access_token"):
         die("user token が返りませんでした（認可 URL の user_scope を確認してください）")
-    return token, None
+    return authed, None
 
 
 class _Catcher(http.server.BaseHTTPRequestHandler):
@@ -1448,25 +1869,25 @@ def install_token(name, token, auth, quiet=False):
     os.makedirs(os.path.join(dir_, "cache"), exist_ok=True)
     os.chmod(PROFILE_ROOT, 0o700)
     os.chmod(dir_, 0o700)
-    stored, err = keychain_set(name, token) if keychain_ok() else (False, "macOS の security が使えません")
+    stored, err = store_set(name, token) if store_ok() else (False, "この OS では資格情報ストアを使えません")
     if stored:
         write_env_stub(dir_)
         if not quiet:
-            print(f"トークンは Keychain に保存しました（service={KEYCHAIN_SERVICE} / account={name}）")
+            print(f"トークンは {store_where(name)} に保存しました")
     else:
         env_path = os.path.join(dir_, "env")
         # open してから chmod すると、その間は umask の権限で読める。ここに置くのは
         # 平文のユーザートークンなので、作成時の mode で 0600 を確定させる
-        fd = os.open(env_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w") as f:
+        fd = os.open(env_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | O_BINARY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(f"SLACK_USER_TOKEN={token}\n")
-        warn(f"Keychain に保存できなかったので {env_path} に平文で置きました: {err}")
+        warn(f"{STORE_LABEL} に保存できなかったので {env_path} に平文で置きました: {err}")
     blob = save_team(dir_, auth)
-    with open(os.path.join(dir_, ".label"), "w") as f:
+    with open(os.path.join(dir_, ".label"), "w", encoding="utf-8") as f:
         f.write(f"{blob['team']} ({blob['user']})\n")
     if not os.path.exists(ACTIVE_FILE):
         os.makedirs(CONFIG_ROOT, exist_ok=True)
-        with open(ACTIVE_FILE, "w") as f:
+        with open(ACTIVE_FILE, "w", encoding="utf-8") as f:
             f.write(name + "\n")
         print(f"有効なプロファイルにしました（切り替えは slk profile use <name>）")
     return blob
@@ -1479,8 +1900,12 @@ def profile_identity(name):
 
 
 def cmd_login(args):
-    opts, rest = take_opts(args, {"--manual": False, "--timeout": True, "--reset-secret": False})
+    opts, rest = take_opts(args, {"--manual": False, "--timeout": True, "--reset-secret": False,
+                                  "--write": False})
     app, app_path = load_app()
+    scopes = list(app.get("user_scopes") or USER_SCOPES)
+    if opts.get("--write"):
+        scopes += [s for s in WRITE_SCOPES if s not in scopes]
     secret = app_secret(app, reset=bool(opts.get("--reset-secret")))
     nonce = secrets.token_urlsafe(16)
 
@@ -1494,7 +1919,7 @@ def cmd_login(args):
     state = f"{srv.server_port if srv else 0}.{nonce}"
     url = AUTHORIZE_URL + "?" + urllib.parse.urlencode({
         "client_id": app["client_id"],
-        "user_scope": ",".join(app.get("user_scopes") or USER_SCOPES),
+        "user_scope": ",".join(scopes),
         "redirect_uri": app["redirect_uri"],
         "state": state})
 
@@ -1526,15 +1951,15 @@ def cmd_login(args):
     if not got.get("code"):
         die("code が取れませんでした")
 
-    token, err = oauth_exchange(app, secret, got["code"])
+    authed, err = oauth_exchange(app, secret, got["code"])
     if err in BAD_SECRET_ERRORS:
-        # 誤入力・ローテーション後の古い値が Keychain に残っているケース。
+        # 誤入力・ローテーション後の古い値がストアに残っているケース。
         # 入れ直して同じ code でもう 1 度だけ試す（失敗した交換では code は消費されない）
         warn(f"client_secret が受け付けられませんでした（{err}）")
         if not sys.stdin.isatty():
             die("対話環境で slk login --reset-secret を実行して入れ直してください")
         secret = app_secret(app, reset=True)
-        token, err = oauth_exchange(app, secret, got["code"])
+        authed, err = oauth_exchange(app, secret, got["code"])
     if err:
         hints = {
             "invalid_code": "コードは 1 度きり・数分で失効します。slk login からやり直してください",
@@ -1543,7 +1968,15 @@ def cmd_login(args):
             "bad_client_secret": "slk login --reset-secret で入れ直してください",
         }
         die(f"トークン交換に失敗しました: {err}" + (f"（{hints[err]}）" if err in hints else ""))
-    auth = call(token, "auth.test")
+    token = authed["access_token"]
+    granted = set(filter(None, (authed.get("scope") or "").split(",")))
+    if opts.get("--write") and not set(WRITE_SCOPES) <= granted:
+        warn("書き込みの権限が付きませんでした。アプリの User Token Scopes に "
+             + ", ".join(WRITE_SCOPES) + " があるか確認してください")
+    elif not opts.get("--write") and granted & set(WRITE_SCOPES):
+        # user token の scope は以前の認可と足し合わされるので、--write を外しても書ける権限が残る
+        warn("このトークンには以前の認可で書き込みの権限が残っています"
+             "（外すにはアプリの認可を取り消してから slk login し直す）")
     # 上書きしてよいのは「同じワークスペースの同じ人」のプロファイルだけ。team_id だけで
     # 一致を見ると、同じワークスペースの別アカウントで入ったときに他方を潰す
     ident = (auth.get("team_id"), auth.get("user_id"))
@@ -1577,8 +2010,8 @@ def cmd_login(args):
 
 
 def cmd_manifest(args):
-    opts, _ = take_opts(args, {"--name": True, "--search": True})
-    scopes = list(USER_SCOPES)
+    opts, _ = take_opts(args, {"--name": True, "--search": True, "--write": False})
+    scopes = list(USER_SCOPES) + (WRITE_SCOPES if opts.get("--write") else [])
     mode = opts.get("--search", "both")
     if mode == "legacy":
         scopes = [s for s in scopes if not s.startswith("search:read.")]
@@ -1587,8 +2020,9 @@ def cmd_manifest(args):
     elif mode != "both":
         die("--search は legacy | rts | both")
     out_json({
-        "display_information": {"name": opts.get("--name", "slk (read-only)"),
-                                "description": "個人用の read-only Slack CLI"},
+        "display_information": {"name": opts.get("--name", "slk" if opts.get("--write") else "slk (read-only)"),
+                                "description": "個人用の Slack CLI" if opts.get("--write")
+                                else "個人用の read-only Slack CLI"},
         "oauth_config": {"scopes": {"user": scopes}},
         "settings": {"org_deploy_enabled": False, "socket_mode_enabled": False,
                      "token_rotation_enabled": False},
@@ -1615,12 +2049,12 @@ def cmd_profile(args):
             return
         active = None
         if os.path.exists(ACTIVE_FILE):
-            active = open(ACTIVE_FILE).readline().strip()
+            active = open(ACTIVE_FILE, encoding="utf-8").readline().strip()
         elif len(names) == 1:
             active = names[0]
         for n in names:
             label_path = os.path.join(PROFILE_ROOT, n, ".label")
-            label = open(label_path).readline().strip() if os.path.exists(label_path) else ""
+            label = open(label_path, encoding="utf-8").readline().strip() if os.path.exists(label_path) else ""
             where = token_where(n)
             if where is None:
                 label = (label + " (未認証)").strip()
@@ -1640,7 +2074,7 @@ def cmd_profile(args):
         if not os.path.isdir(profile_dir(name)):
             die(f"プロファイル '{name}' がありません")
         os.makedirs(CONFIG_ROOT, exist_ok=True)
-        with open(ACTIVE_FILE, "w") as f:
+        with open(ACTIVE_FILE, "w", encoding="utf-8") as f:
             f.write(name + "\n")
         print(f"有効なプロファイル: {name}")
         if os.environ.get("SLK_PROFILE"):
@@ -1680,7 +2114,7 @@ def cmd_profile(args):
             auth = call(Profile(name).token, "auth.test")
             blob = save_team(dir_, auth)
             text = f"{blob['team']} ({blob['user']})"
-        with open(os.path.join(dir_, ".label"), "w") as f:
+        with open(os.path.join(dir_, ".label"), "w", encoding="utf-8") as f:
             f.write(text + "\n")
         print(f"{name}: {text}")
         return
@@ -1691,37 +2125,36 @@ def cmd_profile(args):
         dir_ = profile_dir(name)
         if not os.path.isdir(dir_):
             die(f"プロファイル '{name}' がありません")
-        if not keychain_ok():
-            die("macOS の Keychain が使えません（security コマンドが見つかりません）")
-        token, existing = file_token(dir_), keychain_get(name)
+        if not store_ok():
+            die("この OS では資格情報ストアを使えません（macOS の Keychain か Windows の資格情報マネージャー）")
+        token, existing = file_token(dir_), store_get(name)
         if existing and not token:
-            print(f"'{name}': 既に Keychain にあります")
+            print(f"'{name}': 既に {STORE_LABEL} にあります")
             return
         if existing and token:
             if existing == token:
                 write_env_stub(dir_)
-                print(f"'{name}': Keychain に同じ値があったので、env ファイルの平文を消しました")
+                print(f"'{name}': {STORE_LABEL} に同じ値があったので、env ファイルの平文を消しました")
                 return
-            # Keychain の鍵に設定ディレクトリが入らないので、別の設定ディレクトリの同名
+            # ストアの鍵に設定ディレクトリが入らないので、別の設定ディレクトリの同名
             # プロファイルや失効済みの古い値が居座っていることがある。どちらが正しいかは
             # ここでは判定できないので、消さずに止める
             if not opts.get("--force"):
-                die(f"'{name}': Keychain の値と env ファイルの値が違います。\n"
+                die(f"'{name}': {STORE_LABEL} の値と env ファイルの値が違います。\n"
                     f"    どちらが有効かはここでは判定できないので、平文は消していません。\n"
-                    f"    env の値で Keychain を上書きしてよければ: "
+                    f"    env の値で {STORE_LABEL} を上書きしてよければ: "
                     f"slk profile keychain {name} --force\n"
-                    f"    Keychain 側を残すなら env から SLACK_USER_TOKEN の行を消してください")
-            warn(f"'{name}': Keychain の既存の値を env ファイルの値で上書きします")
+                    f"    {STORE_LABEL} 側を残すなら env から SLACK_USER_TOKEN の行を消してください")
+            warn(f"'{name}': {STORE_LABEL} の既存の値を env ファイルの値で上書きします")
         if not token:
             die(f"'{name}' に移せるトークンがありません（slk profile add {name} で登録）")
-        stored, err = keychain_set(name, token)
+        stored, err = store_set(name, token)
         if not stored:
-            die(f"Keychain に保存できませんでした: {err}")
-        if keychain_get(name) != token:
-            die("Keychain に書いた値を読み戻せませんでした。env ファイルはそのままにしています")
+            die(f"{STORE_LABEL} に保存できませんでした: {err}")
+        if store_get(name) != token:
+            die(f"{STORE_LABEL} に書いた値を読み戻せませんでした。env ファイルはそのままにしています")
         write_env_stub(dir_)
-        print(f"'{name}' のトークンを Keychain に移しました"
-              f"（service={KEYCHAIN_SERVICE} / account={name}）")
+        print(f"'{name}' のトークンを {store_where(name)} に移しました")
         sys.stdout.flush()
         note("env ファイルは上書きしましたが、ディスク上の旧データが残る可能性はあります。")
         note("気になる場合は Slack 側でトークンを再発行してください。")
@@ -1736,27 +2169,27 @@ def cmd_profile(args):
             die(f"プロファイル '{old}' がありません")
         if os.path.exists(new_dir):
             die(f"プロファイル '{new}' は既にあります")
-        # Keychain の account はプロファイル名そのものなので、先に複製して読み戻せることを
+        # ストアの account はプロファイル名そのものなので、先に複製して読み戻せることを
         # 確かめてから元を消す。途中で失敗したら何も壊さずに戻す
-        token = keychain_get(old) if keychain_ok() else None
+        token = store_get(old) if store_ok() else None
         if token:
-            ok, err = keychain_set(new, token)
+            ok, err = store_set(new, token)
             if not ok:
-                die(f"Keychain に '{new}' を作れませんでした: {err}")
-            if keychain_get(new) != token:
-                keychain_del(new)
-                die("Keychain に書いた値を読み戻せませんでした。何も変更していません")
+                die(f"{STORE_LABEL} に '{new}' を作れませんでした: {err}")
+            if store_get(new) != token:
+                store_del(new)
+                die(f"{STORE_LABEL} に書いた値を読み戻せませんでした。何も変更していません")
         try:
             os.rename(old_dir, new_dir)
         except OSError as e:
             if token:
-                keychain_del(new)
+                store_del(new)
             die(f"ディレクトリを移動できませんでした: {e}")
         if token:
-            keychain_del(old)
+            store_del(old)
             write_env_stub(new_dir)
-        if os.path.exists(ACTIVE_FILE) and open(ACTIVE_FILE).readline().strip() == old:
-            with open(ACTIVE_FILE, "w") as f:
+        if os.path.exists(ACTIVE_FILE) and open(ACTIVE_FILE, encoding="utf-8").readline().strip() == old:
+            with open(ACTIVE_FILE, "w", encoding="utf-8") as f:
                 f.write(new + "\n")
             print(f"有効なプロファイル名も '{new}' に更新しました")
         print(f"'{old}' を '{new}' に改名しました")
@@ -1786,9 +2219,9 @@ def cmd_profile(args):
             for d in dirs:
                 os.rmdir(os.path.join(root, d))
         os.rmdir(dir_)
-        if keychain_ok():
-            keychain_del(name)
-        if os.path.exists(ACTIVE_FILE) and open(ACTIVE_FILE).readline().strip() == name:
+        if store_ok():
+            store_del(name)
+        if os.path.exists(ACTIVE_FILE) and open(ACTIVE_FILE, encoding="utf-8").readline().strip() == name:
             os.remove(ACTIVE_FILE)
         print(f"プロファイル '{name}' を削除しました")
         return
@@ -1799,9 +2232,11 @@ def cmd_profile(args):
 
 USAGE = """usage: slk [--profile <name>] [--json|--raw] [--quiet] <command>
 
-  slk manifest [--search both|legacy|rts]   アプリ作成用の manifest を出す
-  slk login [<profile 名>] [--manual] [--reset-secret] [--timeout N]
+  slk manifest [--search both|legacy|rts] [--write]
+                                            アプリ作成用の manifest を出す
+  slk login [<profile 名>] [--manual] [--reset-secret] [--timeout N] [--write]
                                             ブラウザで承認して自分のトークンを取る
+                                            （--write で chat:write も要求する）
   slk profile [list|current|use|add|keychain [--force]|rename|label|path|rm]
   slk whoami                                トークンの持ち主とワークスペース
 
@@ -1824,13 +2259,47 @@ USAGE = """usage: slk [--profile <name>] [--json|--raw] [--quiet] <command>
                                             allowlist 内の読み取りメソッドだけ
   slk profile rm <名前> [-f|--yes]
 
+  slk writable [list|add|rm] [<#channel|@user|C…> ...]
+                                            書き込める宛先（プロファイルごと・既定は空）。
+                                            add は利用者の確認を挟む（端末なら y/N、
+                                            端末でなければ確認ダイアログ）
+  slk post <#channel|@user|C…|permalink> [本文|-] [--thread <ts|permalink>] [--yes]
+                                            [--no-escape]
+                                            投稿する。permalink を渡すとそのスレッドに返信。
+                                            確認を挟み、端末でないときは --yes が要る。
+                                            & < > は既定でエスケープ（<@U…> を効かせるなら
+                                            --no-escape）
+
 ワークスペースの選択は --profile > SLK_PROFILE > slk profile use の順（SLK_TOKEN があればそれが最優先）。
 --all は最後まで辿れなかったら exit 1 になる（出力は途中まで）。
 search は Slack の検索構文をそのまま渡せる（--in / --from / --after は連結するだけの糖衣）。
-ask は前後の文脈ごと取れるが、文章ではなく単語で渡すこと（キーワード一致で、文章は 0 件になる）。"""
+ask は前後の文脈ごと取れるが、文章ではなく単語で渡すこと（キーワード一致で、文章は 0 件になる）。
+
+AI エージェントとして使う場合:
+  - 投稿の前に、宛先と本文を利用者に見せて同意を得る（--yes はその後に付ける）
+  - 許可リストに無い宛先へは書けない。自分で slk writable add せず、利用者に
+    「<宛先> は投稿を許可したチャンネルにありません。追加しますか？」と聞く。
+    同意を得たら slk writable add を実行し、出たダイアログで許可してもらうよう伝える
+  - writable.json を直接編集しない"""
+
+
+def utf8_stdio():
+    """Windows ではパイプやファイルにつないだ標準入出力が ANSI コードページ（日本語なら cp932）に
+    なり、本文の絵文字で UnicodeEncodeError になる。AI エージェント（Claude Code は Git Bash）
+    から使うと常にこの状態なので、端末以外は UTF-8 にする。端末は Python が Unicode のまま
+    書くので触らない。PYTHONIOENCODING / PYTHONUTF8 で明示されていればそれに従う。"""
+    if os.name != "nt" or os.environ.get("PYTHONIOENCODING") or sys.flags.utf8_mode:
+        return
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            if stream and not stream.isatty():
+                stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 def main():
+    utf8_stdio()
     argv = split_global(sys.argv[1:])
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(USAGE)
@@ -1848,7 +2317,7 @@ def main():
     table = {"search": cmd_search, "ask": cmd_ask, "channels": cmd_channels, "users": cmd_users,
              "members": cmd_members, "history": cmd_history, "thread": cmd_thread,
              "read": cmd_read, "cache": cmd_cache, "whoami": cmd_whoami, "api": cmd_api,
-             "file": cmd_file}
+             "file": cmd_file, "writable": cmd_writable, "post": cmd_post}
     if cmd not in table:
         die(f"未知のコマンド: {cmd}\n\n{USAGE}")
     table[cmd](prof, args)

@@ -5,7 +5,7 @@ POSIX シェルのみ）で、設定は `~/.config/<名前>/` に置く。
 
 | | 何をするか | 認証 |
 | --- | --- | --- |
-| [`slk`](slk/) | Slack を利用者として読む（read-only、ワークスペース切替つき） | OAuth（ブラウザ） |
+| [`slk`](slk/) | Slack を利用者として読む（ワークスペース切替つき。投稿は許可したチャンネルだけ） | OAuth（ブラウザ） |
 | [`zoho`](zoho/) | Zoho CRM API v8（`get` / `coql` / 書き込み） | OAuth Self Client |
 | [`mf`](mf/) | マネーフォワード クラウド（請求書・会計） | OAuth + PKCE |
 | [`tldv`](tldv/) | tl;dv（ミーティング・文字起こし・AI ノート） | API キー |
@@ -23,6 +23,8 @@ for t in slk zoho mf tldv gws zp; do ln -s "$PWD/$t/$t" ~/.local/bin/$t; done
 
 必要なものだけ symlink すればよい。`~/.local/bin` に PATH が通っていること。更新は `git pull` だけ。
 
+Windows で動くのは今のところ `slk` だけ（手順は [slk/README.md](slk/README.md)）。
+
 ## セットアップ
 
 **認証はツールごとに違うので、各ディレクトリの README を読むこと。**
@@ -31,7 +33,7 @@ for t in slk zoho mf tldv gws zp; do ln -s "$PWD/$t/$t" ~/.local/bin/$t; done
 ## 共通の作法
 
 - 出力は既定が人間向け。JSON が要るものは `--json` / `--all` を持つ
-- 設定とトークンは `~/.config/<名前>/`。`slk` だけはトークンを macOS Keychain に置く
+- 設定とトークンは `~/.config/<名前>/`。`slk` だけはトークンを OS の資格情報ストア（macOS は Keychain、Windows は資格情報マネージャー）に置く
 - どのツールも、そのサービスの API が返した内容をそのまま見せる。手元での再解釈をしない
 
 ---
