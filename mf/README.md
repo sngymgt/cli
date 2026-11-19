@@ -7,6 +7,8 @@
 
 ## セットアップ
 
+Python 3 が要る（macOS には最初から入っている）。Windows には対応していない。
+
 1. `~/.config/mf/env` に `MF_CLIENT_ID` と `MF_CLIENT_SECRET` を書く
    （マネーフォワードの開発者向け管理画面で発行したもの）
 2. `mf login` でブラウザ認可（OAuth 2.0 authorization code + PKCE）

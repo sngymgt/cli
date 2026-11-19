@@ -22,6 +22,8 @@ Zoho CRM API v8 を直接叩く CLI。MCP では届かない操作（項目の�
 
 ## セットアップ
 
+Python 3 が要る（macOS には最初から入っている。Windows は python.org などから入れる）。
+
 Mac:
 
 ```sh
@@ -31,7 +33,7 @@ chmod +x ~/.local/bin/zoho
 zoho init
 ```
 
-Windows は下の「Windows」で入れてから、同じ手順 1〜3 を PowerShell で流す。
+Windows は下の「Windows」を先に読む。
 
 1. 自分用の「クライアント」を作り、Client ID / Client Secret を手に入れる（最初の 1 回だけ）
    1. ブラウザで**自分の** Zoho アカウントにログインした状態で <https://api-console.zoho.jp/> を開く
@@ -68,38 +70,22 @@ Windows は下の「Windows」で入れてから、同じ手順 1〜3 を PowerS
 
 ### Windows
 
-Python 3（python.org から。インストールの最初の画面で「Add python.exe to PATH」に印を付ける）が要る。
-Windows は先頭の `#!` を読まないので、`python` 経由で起動する入口を置く。PowerShell で:
+Windows は先頭の `#!` を読まず `ln -s` も使えないので、Python から起動する（以下の例の `zoho` は `python <置き場>\zoho` に読み替える）。PowerShell で:
 
 ```powershell
-$d = "$env:LOCALAPPDATA\Programs\zoho"
-New-Item -ItemType Directory -Force $d | Out-Null
-Invoke-WebRequest https://raw.githubusercontent.com/sngymgt/cli/main/zoho/zoho -OutFile "$d\zoho.py"
-Set-Content "$d\zoho.cmd" '@python "%LOCALAPPDATA%\Programs\zoho\zoho.py" %*' -Encoding ascii
-$u = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($u -notlike "*$d*") { [Environment]::SetEnvironmentVariable("Path", "$u;$d", "User") }
-```
-
-PowerShell を開き直してから `zoho init`。
-
-Claude Code など Git Bash から使うときは、入口をもう 1 つ置く（`~/bin` に PATH が通っている前提）:
-
-```sh
-mkdir -p ~/bin
-printf '#!/bin/sh\nexec python "$LOCALAPPDATA/Programs/zoho/zoho.py" "$@"\n' > ~/bin/zoho
-chmod +x ~/bin/zoho
+Invoke-WebRequest https://raw.githubusercontent.com/sngymgt/cli/main/zoho/zoho -OutFile zoho
+python zoho init
 ```
 
 - **`zoho init` は PowerShell かコマンドプロンプトで流す。** Git Bash（mintty）は端末として見えず、
   Client ID と Secret を訊けない。同じ理由で、Git Bash からの `zoho delete` は `-y` が要る
-- 設定は `%USERPROFILE%\.config\zoho` に入り、PowerShell と Git Bash で同じものを使う。Windows では
-  `chmod` で読める人を絞れないので、ユーザーフォルダの既定の権限に任せる
+- 設定は `%USERPROFILE%\.config\zoho` に入り、PowerShell と Git Bash で同じものを使う
 - パイプへの出力は UTF-8。PowerShell で受けて文字化けするときは
   `[Console]::OutputEncoding = [Text.Encoding]::UTF8` を先に流す
 - **PowerShell でファイルに保存するときは `>` ではなく `-o <file>`**（`zoho get ... -o out.json`）。
   Windows PowerShell の `>` は UTF-16 で書き、添付や zip は壊れる
 - **PowerShell では JSON を引数にも標準入力にも渡さず、UTF-8 のファイルで渡す**（`zoho post Accounts @body.json`。
-  BOM ありも可）。入口の `zoho.cmd` を通ると引数の `"` が落ち、Windows PowerShell のパイプは日本語を `?` に変える
+  BOM ありも可）。Windows PowerShell は外部コマンドに渡す引数の `"` を落とし、パイプは日本語を `?` に変える
 - 設定ディレクトリはユーザーフォルダの中にだけ置ける（`ZOHO_CONFIG_DIR` で外を指すと止まる）。
   ★Windows では作ったファイルの読める人をこの CLI で絞れない（置いたフォルダの権限に従う）★ので、
   `-o` で保存するときも共有フォルダに置かない

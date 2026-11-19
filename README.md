@@ -6,11 +6,16 @@ POSIX シェルのみ）で、設定は `~/.config/<名前>/` に置く。
 | | 何をするか | 認証 |
 | --- | --- | --- |
 | [`slk`](slk/) | Slack を利用者として読む（ワークスペース切替つき。投稿は許可したチャンネルだけ） | OAuth（ブラウザ） |
-| [`zoho`](zoho/) | Zoho CRM API v8（`get` / `coql` / 書き込み） | OAuth Self Client |
+| [`zoho`](zoho/) | Zoho CRM API v8（`get` / `coql` / 書き込み） | OAuth（ブラウザ） |
 | [`mf`](mf/) | マネーフォワード クラウド（請求書・会計） | OAuth + PKCE |
 | [`tldv`](tldv/) | tl;dv（ミーティング・文字起こし・AI ノート） | API キー |
 | [`zp`](zp/) | Zoom Phone（通話履歴・録音・録音の文字起こし） | Server-to-Server OAuth |
 | [`gws`](gws/) | `googleworkspace-cli` に認証プロファイル切替を足すラッパー | 本体に委譲 |
+
+## 必要なもの
+
+- Python 3（macOS には最初から入っている。Windows は python.org などから入れる）
+- `gws` だけは Python ではなく、本体の `googleworkspace-cli` が要る（[gws/README.md](gws/README.md)）
 
 ## インストール
 
@@ -23,8 +28,9 @@ for t in slk zoho mf tldv gws zp; do ln -s "$PWD/$t/$t" ~/.local/bin/$t; done
 
 必要なものだけ symlink すればよい。`~/.local/bin` に PATH が通っていること。更新は `git pull` だけ。
 
-Windows で動くのは今のところ `slk`・`gws`（Git Bash から）・`zoho` だけ（手順は [slk/README.md](slk/README.md)・
-[gws/README.md](gws/README.md)・[zoho/README.md](zoho/README.md)）。
+Windows で動くのは今のところ `slk`・`zoho`・`gws`（Git Bash から）だけ。Windows は先頭の `#!` を読まず
+`ln -s` も使えないので、`slk` と `zoho` は Python から起動する（`slk` は `python <clone 先>\slk\slk` と読み替える）。
+`gws` の手順は [gws/README.md](gws/README.md)。
 
 ## セットアップ
 

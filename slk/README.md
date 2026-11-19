@@ -55,6 +55,8 @@ echo "長い本文" | slk post #times-taro - --yes
 
 ## インストール
 
+Python 3 が要る（macOS には最初から入っている。Windows は python.org などから入れる）。
+
 リポジトリ全体の手順は [../README.md](../README.md)。slk だけなら:
 
 ```
@@ -63,23 +65,10 @@ ln -s "$PWD/slk/slk" ~/.local/bin/slk
 
 ### Windows
 
-Python 3（python.org などから。インストール時に PATH に追加する）と Git for Windows が要る。
-Windows は先頭の `#!` を読まず `ln -s` も実体のコピーになるので、`python` 経由で起動する
-小さな入口を PATH の通った場所に置く。clone 先は以下 `<clone 先>` と書く。
-
-Claude Code などの AI から使う場合（Git Bash。`~/bin` に PATH が通っている前提）:
+Windows は先頭の `#!` を読まず `ln -s` も使えないので、Python から起動する（以下の例の `slk` は `python <clone 先>\slk\slk` に読み替える）:
 
 ```
-mkdir -p ~/bin
-printf '#!/bin/sh\nexec python "%s" "$@"\n' "$(cd <clone 先> && pwd -W)/slk/slk" > ~/bin/slk
-chmod +x ~/bin/slk
-slk --help
-```
-
-PowerShell から使う場合は `$PROFILE` に足す:
-
-```
-function slk { python "<clone 先>\slk\slk" @args }
+python <clone 先>\slk\slk --help
 ```
 
 **最初の `slk login` は PowerShell かコマンドプロンプトで行う。** Git Bash（mintty）は端末として

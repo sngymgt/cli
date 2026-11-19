@@ -7,6 +7,8 @@ Zoom Phone API の CLI。通話履歴・録音・録音の文字起こしを取�
 
 ## セットアップ
 
+Python 3 が要る（macOS には最初から入っている）。Windows には対応していない。
+
 1. `zp init` で `~/.config/zp/env` の雛形を作る
 2. <https://marketplace.zoom.us/> の **Develop → Build App → Server-to-Server OAuth** で
    アプリを作り、Account ID / Client ID / Client Secret を記入する

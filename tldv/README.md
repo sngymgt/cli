@@ -7,6 +7,8 @@ tl;dv の API（v1alpha1）CLI。ミーティング一覧・文字起こし・AI
 
 ## セットアップ
 
+Python 3 が要る（macOS には最初から入っている）。Windows には対応していない。
+
 1. `tldv init` で `~/.config/tldv/env` の雛形を作る
 2. tl;dv の管理画面で発行した API キーを `TLDV_API_KEY` に記入する
 3. `tldv health` で疎通を確認する
